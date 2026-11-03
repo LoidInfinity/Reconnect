@@ -1,0 +1,16 @@
+# 运行时生成物（含真实使用痕迹，禁止提交）
+network_guard.log
+network_guard.log.*
+network_guard_state.txt
+network_guard_config.json
+
+# 本地 Python 环境
+.conda/
+__pycache__/
+*.pyc
+
+# 编辑器/系统
+.vscode/*
+!.vscode/settings.json
+Thumbs.db
+desktop.ini
