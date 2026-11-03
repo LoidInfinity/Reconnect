@@ -39,6 +39,8 @@ def main():
         cwd=ROOT, check=True, env=build_env)
     output = ROOT / "dist" / "NetworkGuard"
     shutil.copy2(ROOT / "README.md", output / "README.md")
+    if (ROOT / "LICENSE").exists():
+        shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
     archive = Path(shutil.make_archive(str(ROOT / "dist" / f"NetworkGuard-{VERSION}-windows-x64"),
                                       "zip", ROOT / "dist", "NetworkGuard"))
     with archive.open("rb") as stream:
