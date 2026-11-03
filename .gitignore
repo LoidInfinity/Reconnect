@@ -14,3 +14,8 @@ __pycache__/
 !.vscode/settings.json
 Thumbs.db
 desktop.ini
+
+# Packaging outputs
+build/
+dist/
+*.spec

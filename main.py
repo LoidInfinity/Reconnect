@@ -13,12 +13,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from app_info import DATA_DIR
 
 
 APP_NAME = "network_guard"
-DEFAULT_CONFIG_FILE = Path(__file__).with_name("network_guard_config.json")
-DEFAULT_LOG_FILE = Path(__file__).with_name("network_guard.log")
-DEFAULT_STATE_FILE = Path(__file__).with_name("network_guard_state.txt")
+DEFAULT_CONFIG_FILE = DATA_DIR / "network_guard_config.json"
+DEFAULT_LOG_FILE = DATA_DIR / "network_guard.log"
+DEFAULT_STATE_FILE = DATA_DIR / "network_guard_state.txt"
 DEFAULT_CHECK_TARGETS = (
 	"https://www.msftconnecttest.com/connecttest.txt",
 	"https://www.baidu.com",

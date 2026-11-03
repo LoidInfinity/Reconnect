@@ -12,14 +12,19 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
+import traceback
+import webbrowser
 import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter import font as tkfont
 from urllib.parse import urlparse
 
 import main as guard
+from app_info import VERSION, APP_DIR, FROZEN, worker_command
+from updates import check_updates
 
-BASE = Path(__file__).resolve().parent
+BASE = APP_DIR
 BG = "#f3f6fb"
 INK = "#172b4d"
 MUTED = "#64748b"
@@ -88,6 +93,7 @@ def initial_enabled_profiles(profiles: list[str], interfaces: list[dict], disabl
 
 
 def save_settings(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
@@ -158,13 +164,14 @@ class GuardApp:
         self.stopping = False
         self.closing = False
         self.refreshing = False
+        self.checking_updates = False
         self.config_error = None
         try:
             self.config = validate_settings(read_settings(config_path))
         except (ValueError, OSError, TypeError, KeyError) as exc:
             self.config_error = str(exc)
             self.config = read_settings(BASE / "__unused_defaults__.json")
-        root.title("Network Guard · 网络守护")
+        root.title(f"Network Guard · 网络守护 {VERSION}")
         root.geometry("1080x780")
         root.minsize(900, 700)
         root.configure(bg=BG)
@@ -200,6 +207,10 @@ class GuardApp:
                      font=("Microsoft YaHei UI", size, "bold")).pack(anchor="w", padx=20, pady=(30 if size == 18 else 10, 0))
         tk.Label(sidebar, text="Windows Wi-Fi\n自动检测 · 断线恢复", justify="left", bg="#11233f",
                  fg="#9eb2d0", font=("Microsoft YaHei UI", 10), pady=25).pack(side="bottom", padx=20, anchor="w")
+        self.update_button = ttk.Button(sidebar, text="检查 GitHub 更新", command=self.check_for_updates)
+        self.update_button.pack(side="bottom", padx=20, pady=8, anchor="w")
+        tk.Label(sidebar, text=f"v{VERSION}", bg="#11233f", fg="#9eb2d0",
+                 font=("Microsoft YaHei UI", 10)).pack(side="bottom", padx=20, anchor="w")
         # A scrollable content area preserves full widget heights at high DPI
         # and in small windows instead of letting pack clip the bottom controls.
         viewport = ttk.Frame(self.root)
@@ -424,12 +435,20 @@ class GuardApp:
             return
         self.generation += 1
         generation = self.generation
+        event_path = None
         try:
-            self.process = subprocess.Popen([sys.executable, "-u", str(Path(__file__).resolve()), "--worker", "--config", str(self.config_path)],
+            command = worker_command(self.config_path)
+            if FROZEN or sys.stdout is None:
+                with tempfile.NamedTemporaryFile(prefix="network-guard-", suffix=".jsonl", delete=False) as stream:
+                    event_path = Path(stream.name)
+                command += ["--event-file", str(event_path)]
+            self.process = subprocess.Popen(command,
                 cwd=BASE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 encoding="utf-8", errors="replace", env=dict(os.environ, PYTHONIOENCODING="utf-8"),
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         except OSError as exc:
+            if event_path:
+                event_path.unlink(missing_ok=True)
             messagebox.showerror("无法启动", str(exc), parent=self.root)
             return
         process = self.process
@@ -438,15 +457,46 @@ class GuardApp:
         self.set_status("正在启动", "busy")
         self.stats.configure(text="最近检测 —    |    本次恢复成功 0 / 0")
         def read_output():
-            with process.stdout:
-                for line in process.stdout:
+            source = event_path.open(encoding="utf-8", errors="replace") if event_path else process.stdout
+            pending = ""
+            try:
+                while True:
+                    line = source.readline()
+                    if not line:
+                        if event_path and process.poll() is None:
+                            time.sleep(0.1)
+                            continue
+                        break
+                    if event_path:
+                        pending += line
+                        if not pending.endswith("\n") and process.poll() is None:
+                            continue
+                        line, pending = pending, ""
                     try:
                         event = json.loads(line)
                     except ValueError:
                         event = dict(kind="log", text=line.rstrip(), level="ERROR")
                     self.events.put((generation, event))
+            finally:
+                source.close()
+                if event_path:
+                    process.wait()
+                    process.stdout.close()
+                    event_path.unlink(missing_ok=True)
             self.events.put((generation, dict(kind="exit", code=process.wait())))
         threading.Thread(target=read_output, daemon=True).start()
+
+    def check_for_updates(self):
+        if self.checking_updates:
+            return
+        self.checking_updates = True
+        self.update_button.configure(state="disabled", text="正在检查…")
+        def task():
+            try:
+                self.events.put((None, dict(kind="update", result=check_updates())))
+            except Exception as exc:
+                self.events.put((None, dict(kind="update", error=str(exc))))
+        threading.Thread(target=task, daemon=True).start()
 
     def stop(self):
         if self.process and not self.stopping:
@@ -496,7 +546,19 @@ class GuardApp:
             if generation is not None and generation != self.generation:
                 continue
             kind = event["kind"]
-            if kind == "log":
+            if kind == "update":
+                self.checking_updates = False
+                self.update_button.configure(state="normal", text="检查 GitHub 更新")
+                if "error" in event:
+                    messagebox.showwarning("检查更新失败", event["error"], parent=self.root)
+                elif event["result"]["available"]:
+                    result = event["result"]
+                    if messagebox.askyesno("发现新版本", f"当前版本：{VERSION}\n新版本：{result['latest']}\n\n是否打开 GitHub 发布页下载？", parent=self.root):
+                        webbrowser.open(result["url"])
+                else:
+                    text = "仓库尚未发布可识别的版本。" if event["result"]["latest"] is None else "当前已是最新版本。"
+                    messagebox.showinfo("检查更新", f"当前版本：{VERSION}\n{text}", parent=self.root)
+            elif kind == "log":
                 self.append_log(event["text"], event.get("level", "INFO"))
             elif kind in ("inventory", "inventory_error"):
                 self.refreshing = False
@@ -547,15 +609,37 @@ def main():
     parser = argparse.ArgumentParser(description="Network Guard 图形界面")
     parser.add_argument("--config", type=Path, default=guard.DEFAULT_CONFIG_FILE)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--event-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--smoke-test", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.config = args.config.resolve()
     if args.worker:
-        worker(args.config)
+        if args.event_file:
+            with args.event_file.open("a", encoding="utf-8", buffering=1) as stream:
+                sys.stdout = sys.stderr = stream
+                try:
+                    worker(args.config)
+                except Exception:
+                    traceback.print_exc()
+                    raise SystemExit(1)
+        else:
+            worker(args.config)
         return
     if sys.platform == "win32":
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     root = tk.Tk()
+    if args.smoke_test:
+        # Offline packaged smoke test: construct every tab, without netsh/network.
+        from unittest.mock import patch
+        with patch.object(GuardApp, "refresh"):
+            app = GuardApp(root, args.config)
+        for tab in app.notebook.tabs():
+            app.notebook.select(tab)
+            root.update()
+        args.smoke_test.write_text(json.dumps(dict(version=VERSION, frozen=FROZEN, tabs=len(app.notebook.tabs()))), encoding="utf-8")
+        root.destroy()
+        return
     GuardApp(root, args.config)
     root.mainloop()
 

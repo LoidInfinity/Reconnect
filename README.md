@@ -2,6 +2,30 @@
 
 Windows Wi-Fi 自动恢复工具，提供中文桌面界面和命令行入口。
 
+当前版本：**0.1.0-alpha.1**（预发布版）。
+
+## Windows 打包版
+
+解压 `NetworkGuard-0.1.0-alpha.1-windows-x64.zip`，进入 `NetworkGuard` 文件夹双击 `NetworkGuard.exe`。无需安装 Python；请保留同目录的 `_internal` 文件夹。
+
+打包版配置、日志及状态文件保存在 `%LOCALAPPDATA%\NetworkGuard`，源码运行仍保存在项目目录。现有源码配置不会自动复制；可自行复制配置并检查其中日志和状态路径，或在新界面重新设置。
+
+侧栏显示当前版本，点击“检查 GitHub 更新”会查询本仓库 GitHub Releases。Alpha 版本会检查包含预发布版在内的新版本，正式版只提示正式版更新。发现新版后可打开发布页手动下载；程序不自动下载或覆盖自身。暂无 Release、网络失败和请求限流会分别提示。版本按 SemVer 比较，支持 `v0.1.0-alpha.2` 等标签。
+
+发布者需要创建对应 GitHub Release 并附上 ZIP，检查更新才能发现它；单独推送代码或标签不等于发布更新。
+
+## 构建与测试
+
+在 Windows x64、Python 3.10+（本版使用 Python 3.14）环境运行：
+
+```powershell
+python -m pip install -r requirements-build.txt
+python -m unittest -v test_gui test_updates
+python build.py
+```
+
+`dist` 中生成完整程序目录、版本 ZIP 和 SHA-256 校验文件。构建使用 PyInstaller 无控制台模式，后台守护通过临时事件文件回传日志。构建产物不提交到源码仓库。
+
 ## 启动桌面界面
 
 双击 `start_gui.bat`，或运行：
