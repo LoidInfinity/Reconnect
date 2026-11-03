@@ -4,15 +4,18 @@ import argparse
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import os
 import platform
 import re
-import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+import repairs
 from app_info import DATA_DIR
 
 
@@ -20,11 +23,52 @@ APP_NAME = "network_guard"
 DEFAULT_CONFIG_FILE = DATA_DIR / "network_guard_config.json"
 DEFAULT_LOG_FILE = DATA_DIR / "network_guard.log"
 DEFAULT_STATE_FILE = DATA_DIR / "network_guard_state.txt"
+DEFAULT_PID_FILE = DATA_DIR / "network_guard.pid"
 DEFAULT_CHECK_TARGETS = (
-	"https://www.msftconnecttest.com/connecttest.txt",
-	"https://www.baidu.com",
-	"https://www.cloudflare.com",
+	"https://www.todesk.com",
+	"https://sunlogin.oray.com",
+	"https://www.awesun.com",
 )
+# Domains used to tell a DNS fault apart from a plain link outage. Neutral
+# public hosts only: no personal or workplace domain belongs in the source.
+DEFAULT_DNS_HOSTS = ("www.todesk.com", "sunlogin.oray.com", "www.awesun.com")
+LEGACY_CHECK_TARGETS = ("https://www.msftconnecttest.com/connecttest.txt", "https://www.baidu.com", "https://www.cloudflare.com")
+INTERIM_CHECK_TARGETS = ("https://connect.rom.miui.com/generate_204", "https://connectivitycheck.platform.hicloud.com/generate_204")
+
+
+def migrate_config(data: dict[str, Any]) -> dict[str, Any]:
+	"""Upgrade known defaults and legacy keys without replacing custom targets."""
+	data = dict(data)
+	if data.get("check_targets") in (list(LEGACY_CHECK_TARGETS), list(INTERIM_CHECK_TARGETS)):
+		data["check_targets"] = list(DEFAULT_CHECK_TARGETS)
+	if data.get("dns_check_hosts") in (["www.baidu.com", "www.cloudflare.com"], ["connect.rom.miui.com", "connectivitycheck.platform.hicloud.com"]):
+		data["dns_check_hosts"] = list(DEFAULT_DNS_HOSTS)
+	if "enabled_profiles" not in data and data.get("allowed_profiles"):
+		data["enabled_profiles"] = data["allowed_profiles"]
+	return data
+
+_MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
+_GUID_RE = re.compile(r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b")
+_NETWORK_FIELD_RE = re.compile(
+	r"(?i)\b(SSID|AP BSSID|BSSID|Profile|配置文件|物理地址)\s*[:：]\s*[^|\n]*"
+)
+_DATACLASS_FIELD_RE = re.compile(r"(?i)\b(ssid|bssid|profile)='[^']*'")
+
+
+def redact(text: str) -> str:
+	"""Mask device identifiers before they reach a log line.
+
+	``netsh wlan show interfaces`` prints the SSID, the AP BSSID and the
+	adapter MAC. Those identify a person's location and hardware, so they are
+	scrubbed from disk logs while the GUI still shows them in its own widgets.
+	"""
+	if not text:
+		return ""
+	text = _GUID_RE.sub("<guid>", text)
+	text = _MAC_RE.sub("<mac>", text)
+	text = _NETWORK_FIELD_RE.sub(lambda match: f"{match.group(1)}: <redacted>", text)
+	text = _DATACLASS_FIELD_RE.sub(lambda match: f"{match.group(1)}='<redacted>'", text)
+	return text
 
 
 @dataclass(frozen=True)
@@ -42,7 +86,7 @@ def load_config(config_file: Path) -> dict[str, Any]:
 		return {}
 	try:
 		with open(config_file, "r", encoding="utf-8") as f:
-			return json.load(f)
+			return migrate_config(json.load(f))
 	except (json.JSONDecodeError, OSError) as exc:
 		print(f"警告: 无法读取配置文件 {config_file}: {exc}", file=sys.stderr)
 		return {}
@@ -56,10 +100,18 @@ def save_default_config(config_file: Path) -> None:
 		"preferred_profiles": [],
 		"disabled_profiles": [],
 		"interface": None,
-		"log_file": str(DEFAULT_LOG_FILE),
+		"log_file": DEFAULT_LOG_FILE.name,
 		"log_max_bytes": 2 * 1024 * 1024,
 		"log_backup_count": 5,
-		"state_file": str(DEFAULT_STATE_FILE),
+		"state_file": DEFAULT_STATE_FILE.name,
+		"pid_file": DEFAULT_PID_FILE.name,
+		"heartbeat_interval": 60,
+		"prevent_sleep": True,
+		"cleanup_proxy_on_disconnect": True,
+		"repair_dns_on_failure": True,
+		"dns_check_hosts": list(DEFAULT_DNS_HOSTS),
+		"wifi_recovery": True,
+		"adapter_reset_on_failure": True,
 		"verbose": False,
 	}
 	try:
@@ -136,6 +188,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		help="记录最近一次成功连接的 Wi-Fi 配置名称。",
 	)
 	parser.add_argument(
+		"--pid-file",
+		default=None,
+		help="PID 文件路径，用于崩溃检测。",
+	)
+	parser.add_argument(
+		"--heartbeat-interval",
+		type=int,
+		default=None,
+		help="心跳日志间隔，单位秒，默认 60。",
+	)
+	parser.add_argument(
+		"--no-prevent-sleep",
+		action="store_true",
+		help="不阻止系统休眠（默认阻止，以保持守护持续运行）。",
+	)
+	parser.add_argument(
+		"--no-cleanup-proxy",
+		action="store_true",
+		help="断网时不清理系统代理（默认会关闭系统代理，修复代理工具失效导致的断网）。",
+	)
+	parser.add_argument(
+		"--no-repair-dns",
+		action="store_true",
+		help="DNS 解析故障时不自动修复（默认清空缓存并重置网卡 DNS）。",
+	)
+	parser.add_argument(
+		"--no-reset-adapter",
+		action="store_true",
+		help="全部配置失败后不重置 Wi-Fi 网卡（默认会尝试禁用/启用网卡）。",
+	)
+	parser.add_argument(
+		"--no-wifi-recovery",
+		action="store_true",
+		help="只做代理/DNS 修复，不重连 Wi-Fi（有线环境建议加此参数）。",
+	)
+	parser.add_argument("--allowed-profile", action="append", default=[], help="兼容旧版：仅允许指定 Wi-Fi 配置参与恢复，可重复。")
+	parser.add_argument("--wifi-recovery", action="store_true", help="兼容旧版：启用 Wi-Fi 恢复。")
+	parser.add_argument(
 		"--verbose",
 		action="store_true",
 		help="同时在控制台输出调试日志。",
@@ -176,7 +266,48 @@ def ensure_windows(logger: logging.Logger) -> None:
 
 
 def run_command(command: list[str], logger: logging.Logger, timeout: int | None = 30) -> subprocess.CompletedProcess[str]:
+	"""Run a command but never let a wedged child freeze the monitor loop.
+
+	``netsh`` can block inside the WLAN driver, where ``kill()`` does not
+	return and ``subprocess.run(timeout=)`` would hang forever. The wait is
+	therefore bounded by a daemon thread: if it is still alive we abandon it
+	and report a timeout, because a daemon thread cannot keep the process up.
+	"""
 	logger.debug("执行命令: %s (超时: %s 秒)", " ".join(command), timeout or "无限")
+	if timeout is None:
+		return _execute(command, logger, None)
+
+	bucket: list[subprocess.CompletedProcess[str]] = []
+	failure: list[BaseException] = []
+
+	def _target() -> None:
+		try:
+			bucket.append(_execute(command, logger, timeout))
+		except BaseException as exc:  # noqa: BLE001
+			failure.append(exc)
+
+	thread = threading.Thread(target=_target, daemon=True)
+	started = time.time()
+	thread.start()
+	thread.join(timeout)
+	repairs.detect_sleep(logger, timeout, time.time() - started)
+
+	if thread.is_alive():
+		logger.warning("⚠ 命令超时 (%s 秒) 且子进程无响应，已放弃等待: %s", timeout, " ".join(command))
+		return subprocess.CompletedProcess(
+			args=command,
+			returncode=-1,
+			stdout="",
+			stderr=f"Command timeout after {timeout} seconds",
+		)
+	if failure:
+		raise failure[0]
+	if bucket:
+		return bucket[0]
+	return subprocess.CompletedProcess(args=command, returncode=-1, stdout="", stderr="")
+
+
+def _execute(command: list[str], logger: logging.Logger, timeout: int | None) -> subprocess.CompletedProcess[str]:
 	try:
 		completed = subprocess.run(
 			command,
@@ -185,7 +316,7 @@ def run_command(command: list[str], logger: logging.Logger, timeout: int | None 
 			timeout=timeout,
 			creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
 		)
-	except subprocess.TimeoutExpired as exc:
+	except subprocess.TimeoutExpired:
 		logger.warning("命令执行超时 (%s 秒): %s", timeout, " ".join(command))
 		return subprocess.CompletedProcess(
 			args=command,
@@ -207,9 +338,9 @@ def run_command(command: list[str], logger: logging.Logger, timeout: int | None 
 	stdout = (stdout_text or "").strip()
 	stderr = (stderr_text or "").strip()
 	if stdout:
-		logger.debug("命令输出: %s", stdout.replace("\r", " ").replace("\n", " | "))
+		logger.debug("命令输出: %s", redact(stdout.replace("\r", " ").replace("\n", " | ")))
 	if stderr:
-		logger.debug("命令错误输出: %s", stderr.replace("\r", " ").replace("\n", " | "))
+		logger.debug("命令错误输出: %s", redact(stderr.replace("\r", " ").replace("\n", " | ")))
 	logger.debug("命令返回码: %s", completed.returncode)
 	return result
 
@@ -245,6 +376,18 @@ def write_state_file(state_file: Path, profile_name: str, logger: logging.Logger
 		state_file.write_text(profile_name.strip(), encoding="utf-8")
 	except OSError as exc:
 		logger.debug("写入状态文件失败: %s", exc)
+
+
+def resolve_path(path_str: str) -> Path:
+	"""相对路径一律基于程序目录。
+
+	开机自启时工作目录可能是 System32，按 cwd 解析会把日志和状态文件
+	写到系统目录里，下次又读不到，看起来就像"配置没生效"。
+	"""
+	path = Path(path_str)
+	if not path.is_absolute():
+		path = DATA_DIR / path
+	return path
 
 
 def parse_wifi_interfaces(output: str) -> list[WifiInterface]:
@@ -311,29 +454,53 @@ def get_saved_profiles(logger: logging.Logger) -> list[str]:
 	return deduped
 
 
-def is_internet_reachable(logger: logging.Logger, targets: Iterable[str], timeout_seconds: int = 4) -> bool:
-	ping_targets = ["1.1.1.1", "8.8.8.8"]
-	for host in ping_targets:
+def ping_reachable(logger: logging.Logger, timeout_seconds: int = 2) -> bool:
+	"""链路层是否通：ping 得通公共地址就说明链路（Wi-Fi/以太网）没断。"""
+	for host in ("223.5.5.5", "119.29.29.29"):
 		try:
 			timeout_ms = max(1, timeout_seconds * 1000)
-			completed = run_command(["ping", "-n", "1", "-w", str(timeout_ms), host], logger)
+			completed = run_command(
+				["ping", "-n", "1", "-w", str(timeout_ms), host], logger, timeout_seconds + 5
+			)
 			if completed.returncode == 0:
 				logger.debug("Ping 检查成功: %s", host)
 				return True
 		except Exception as exc:  # noqa: BLE001
 			logger.debug("Ping 检查失败: %s, %s", host, exc)
+	return False
 
+
+def http_reachable(logger: logging.Logger, targets: Iterable[str], timeout_seconds: int = 4) -> bool:
+	"""应用层是否通。每次新建 opener，避免缓存住旧的系统代理设置。"""
 	import urllib.request
 
 	for target in targets:
 		try:
-			with urllib.request.urlopen(target, timeout=timeout_seconds) as response:
+			opener = urllib.request.build_opener()
+			with opener.open(target, timeout=timeout_seconds) as response:
+				# Dedicated 204 endpoints must not accept a portal/login page as online.
+				if target.rstrip("/").endswith("/generate_204"):
+					if response.status == 204 and response.geturl() == target:
+						return True
+					logger.debug("联网探测未返回原地址的 204：%s", target)
+					continue
 				if 200 <= getattr(response, "status", 200) < 400:
-					logger.debug("联网检测成功: %s", target)
+					logger.debug("HTTP 检测成功: %s", target)
 					return True
 		except Exception as exc:  # noqa: BLE001
-			logger.debug("联网检测失败: %s, %s", target, exc)
+			logger.debug("HTTP 检测失败: %s, %s", target, exc)
 	return False
+
+
+def is_internet_reachable(logger: logging.Logger, targets: Iterable[str], timeout_seconds: int = 4) -> bool:
+	"""以 HTTP(S) 结果为准，而不是 ping。
+
+	代理工具失效时 ping 依然通、只有应用层断，用 ping 判定会漏报。因此
+	ping 只用来区分"链路断了"和"链路正常但应用层坏了"（``ping_reachable``），
+	判定是否在线一律看 HTTP。未配置检测地址时使用默认 HTTP 目标。
+	"""
+	targets = list(targets) or list(DEFAULT_CHECK_TARGETS)
+	return http_reachable(logger, targets, timeout_seconds)
 
 
 def connect_wifi(profile_name: str, logger: logging.Logger, interface_name: str | None) -> bool:
@@ -396,12 +563,73 @@ def recover_network(
 	check_targets: list[str],
 	disabled_profiles: list[str] | None = None,
 	enabled_profiles: list[str] | None = None,
+	cleanup_proxy: bool = False,
+	repair_dns_enabled: bool = False,
+	dns_check_hosts: Iterable[str] | None = None,
+	wifi_recovery: bool = True,
+	adapter_reset: bool = False,
+	dns_reset_interfaces: Iterable[str] | None = None,
+	repair_stats: dict[str, int] | None = None,
 ) -> bool:
+	"""按"DNS → 系统代理 → Wi-Fi 重连 → 网卡重置"的顺序修复，从轻到重。
+
+	ping 成功只说明 ICMP 可达，不能证明 HTTP 或远控流量正常。
+	应用层修复后 HTTP 仍失败时，继续按参与恢复名单尝试 Wi-Fi 重连。
+	"""
+	repaired = False
+
+	# 1) DNS：域名解析失败说明 DNS 被破坏，而不是链路断
+	if repair_dns_enabled:
+		hosts = list(dns_check_hosts or ())
+		failed = repairs.check_dns_resolution(logger, hosts) if hosts else []
+		if failed:
+			repaired = True
+			logger.warning("检测到 DNS 解析故障（%s 无法解析），尝试自动修复。", ", ".join(failed))
+			if repairs.repair_dns(logger, list(dns_reset_interfaces or []) or repairs.get_up_interface_names(logger)):
+				remaining = repairs.check_dns_resolution(logger, hosts)
+				if remaining:
+					logger.warning("DNS 修复后仍有域名解析失败: %s", ", ".join(remaining))
+				else:
+					logger.info("✓ DNS 修复后解析恢复正常。")
+					if repair_stats is not None:
+						repair_stats["dns_repairs"] = repair_stats.get("dns_repairs", 0) + 1
+					if is_internet_reachable(logger, check_targets):
+						logger.info("✓ DNS 修复后网络已恢复，无需继续清理代理。")
+						return True
+		else:
+			logger.debug("DNS 解析正常，跳过修复。")
+
+	# 2) 系统代理：代理工具退出后 Windows 仍指向失效端口
+	if cleanup_proxy:
+		repaired = True
+		if repairs.clear_proxy_settings(logger):
+			time.sleep(2)
+			if is_internet_reachable(logger, check_targets):
+				if repair_stats is not None:
+					repair_stats["proxy_cleanups"] = repair_stats.get("proxy_cleanups", 0) + 1
+				logger.info("✓ 清理系统代理后网络已恢复。")
+				return True
+
+	# 应用层修完再判定一次，避免白连一次 Wi-Fi
+	if repaired:
+		if is_internet_reachable(logger, check_targets):
+			logger.info("✓ 应用层修复后网络已恢复。")
+			return True
+
+	if not wifi_recovery:
+		logger.info("Wi-Fi 重连恢复已禁用，跳过。")
+		return False
+	if ping_reachable(logger):
+		logger.warning("Ping 可达但 HTTP 检测仍失败，继续执行允许的 Wi-Fi 恢复，不将 ping 成功视为网络恢复。")
+
 	interfaces = get_wifi_interfaces(logger, interface_name)
 	if interfaces:
-		logger.info("当前 Wi-Fi 状态: %s", "; ".join(f"{item.name}={item.state}({item.ssid or 'no-ssid'})" for item in interfaces))
+		logger.info(
+			"当前 Wi-Fi 状态: %s",
+			redact("; ".join(f"{item.name}={item.state}({item.ssid or 'no-ssid'})" for item in interfaces)),
+		)
 	else:
-		logger.info("未识别到可用的 Wi-Fi 网卡，仍将尝试对已保存配置发起连接。")
+		logger.warning("未识别到可用的 Wi-Fi 网卡（netsh 可能已超时或网卡卡死）。")
 
 	saved_profiles = get_saved_profiles(logger)
 	last_successful = read_state_file(state_file)
@@ -409,6 +637,13 @@ def recover_network(
 
 	if not candidates:
 		logger.warning("没有可参与恢复的 Wi-Fi 配置（未保存配置或已全部禁用）。")
+		# Resetting an adapter can auto-join an excluded profile. Respect the
+		# participation switches even when profile discovery fails.
+		if adapter_reset and enabled_profiles is None and not disabled_profiles:
+			logger.info("无可用配置，尝试硬件重置 Wi-Fi 网卡…")
+			if repairs.reset_wifi_adapter(logger):
+				time.sleep(10)
+				return is_internet_reachable(logger, check_targets)
 		return False
 
 	logger.info("开始自动恢复，共有 %d 个候选配置，限定时间 %d 秒", len(candidates), reconnect_timeout)
@@ -449,6 +684,18 @@ def recover_network(
 		logger.warning("配置 %s 已发起连接，但在 20 秒内仍未恢复联网 (尝试 %d 次)", profile_name, attempts)
 
 	logger.error("✗ 已尝试全部 %d 个候选 Wi-Fi 配置，网络仍未恢复。", len(candidates))
+
+	# 3) 最后手段：禁用再启用网卡，突破驱动层挂起（需管理员权限）
+	if adapter_reset and (enabled_profiles is not None or disabled_profiles):
+		logger.info("为遵守 Wi-Fi 参与恢复限制，跳过可能自动连接其他配置的网卡重置。")
+	if adapter_reset and enabled_profiles is None and not disabled_profiles:
+		logger.info("所有候选配置均失败，尝试硬件重置 Wi-Fi 网卡…")
+		if repairs.reset_wifi_adapter(logger):
+			time.sleep(10)
+			if is_internet_reachable(logger, check_targets):
+				logger.info("✓ 网卡重置后网络已恢复。")
+				return True
+			logger.warning("网卡已重置但网络仍未恢复。")
 	return False
 
 
@@ -472,7 +719,13 @@ def output_startup_diagnostics(args: argparse.Namespace, logger: logging.Logger)
 	interfaces = get_wifi_interfaces(logger, args.interface)
 	if interfaces:
 		for iface in interfaces:
-			logger.info("  - %s: %s (SSID: %s, 信号: %s)", iface.name, iface.state, iface.ssid or "未连接", iface.signal or "N/A")
+			logger.info(
+				"  - %s: %s (SSID: %s, 信号: %s)",
+				iface.name,
+				iface.state,
+				"<redacted>" if iface.ssid else "未连接",
+				iface.signal or "N/A",
+			)
 	else:
 		logger.info("  - 未识别到 Wi-Fi 网卡或网卡不可用")
 	
@@ -484,20 +737,51 @@ def output_startup_diagnostics(args: argparse.Namespace, logger: logging.Logger)
 	else:
 		logger.warning("  - 未找到任何已保存的 Wi-Fi 配置")
 	
+	logger.info("恢复策略:")
+	logger.info("  - 系统代理清理: %s", "启用（断网时关闭系统代理）" if args.cleanup_proxy else "禁用")
+	logger.info("  - DNS 故障修复: %s", "启用（清空缓存 + 网卡 DNS 回退 DHCP）" if args.repair_dns else "禁用")
+	logger.info("  - Wi-Fi 重连恢复: %s", "启用" if args.wifi_recovery else "禁用（有线环境）")
+	logger.info("  - 失败后重置网卡: %s", "启用" if args.adapter_reset else "禁用")
+	logger.info("  - 阻止系统休眠: %s", "启用" if args.prevent_sleep else "禁用")
+	logger.info("  - 心跳间隔: %s 秒", args.heartbeat_interval)
+	logger.info("  - DNS 监测域名: %s", ", ".join(args.dns_check_hosts or []) or "(未配置)")
+
 	logger.info("========== 诊断完成，监控循环启动 ==========")
 
 
 def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 	state_file = Path(args.state_file)
+	pid_file = Path(args.pid_file)
 	check_targets = list(dict.fromkeys(args.check_target or list(DEFAULT_CHECK_TARGETS)))
-	logger.info("程序启动，轮询间隔=%s 秒，重连超时=%s 秒", args.interval, args.reconnect_timeout)
+	dns_check_hosts = list(dict.fromkeys(args.dns_check_hosts or []))
+	logger.info("程序启动，PID: %s，轮询间隔=%s 秒，重连超时=%s 秒", os.getpid(), args.interval, args.reconnect_timeout)
 	logger.info("联网检测目标: %s", check_targets)
+	logger.info("DNS 解析监测域名: %s", dns_check_hosts or "(未配置)")
+
+	# PID 文件让下一次启动能判断"上次是不是崩了"，退出原因写进日志
+	repairs.write_pid_file(pid_file)
+	reason: dict[str, str | None] = {"value": None}
+	repairs.install_signal_handlers(logger, pid_file, lambda text: reason.update(value=text))
+	repairs.register_exit_handler(logger, pid_file, lambda: reason["value"])
 
 	last_online = None
-	recovery_stats = {"attempts": 0, "successes": 0, "failures": 0}
-	
+	recovery_stats = {"attempts": 0, "successes": 0, "failures": 0, "dns_repairs": 0, "proxy_cleanups": 0}
+	last_heartbeat = time.time()
+
 	while True:
 		try:
+			# 心跳：长时间无输出时，才能区分"没事发生"和"程序卡死"
+			now = time.time()
+			if now - last_heartbeat >= max(1, args.heartbeat_interval):
+				logger.info(
+					"💓 心跳: 运行中，统计: %d/%d 次恢复成功",
+					recovery_stats["successes"],
+					recovery_stats["attempts"],
+				)
+				for handler in logger.handlers:
+					handler.flush()
+				last_heartbeat = now
+
 			online = is_internet_reachable(logger, check_targets)
 			if online:
 				if last_online is not True:
@@ -505,7 +789,7 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 				last_online = True
 			else:
 				if last_online is not False:
-					logger.warning("检测到网络不可用，准备执行 Wi-Fi 自动恢复。")
+					logger.warning("检测到网络不可用，准备自动修复。")
 				last_online = False
 				recovery_stats["attempts"] += 1
 				
@@ -518,26 +802,48 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 					check_targets=check_targets,
 					disabled_profiles=getattr(args, "disabled_profiles", []),
 					enabled_profiles=getattr(args, "enabled_profiles", None),
+					cleanup_proxy=args.cleanup_proxy,
+					repair_dns_enabled=args.repair_dns,
+					dns_check_hosts=dns_check_hosts,
+					wifi_recovery=args.wifi_recovery,
+					adapter_reset=args.adapter_reset,
+					dns_reset_interfaces=getattr(args, "dns_reset_interfaces", []),
+					repair_stats=recovery_stats,
 				)
 				
 				if recovered:
 					recovery_stats["successes"] += 1
 					success_rate = 100 * recovery_stats["successes"] / recovery_stats["attempts"]
 					logger.info("恢复成功率统计: %d/%d (%.1f%%)", recovery_stats["successes"], recovery_stats["attempts"], success_rate)
+					logger.info("分项统计：DNS 修复 %d 次，代理清理后恢复 %d 次", recovery_stats["dns_repairs"], recovery_stats["proxy_cleanups"])
 				else:
 					recovery_stats["failures"] += 1
 					failure_rate = 100 * recovery_stats["failures"] / recovery_stats["attempts"]
 					logger.warning("恢复失败率统计: %d/%d (%.1f%%)", recovery_stats["failures"], recovery_stats["attempts"], failure_rate)
 		except KeyboardInterrupt:
+			reason["value"] = "用户按下 Ctrl+C"
 			if recovery_stats["attempts"] > 0:
 				success_rate = 100 * recovery_stats["successes"] / recovery_stats["attempts"]
 				logger.info("程序退出前的恢复统计: 成功 %d/%d (%.1f%%)", recovery_stats["successes"], recovery_stats["attempts"], success_rate)
 			logger.info("收到中断信号，程序退出。")
+			repairs.remove_pid_file(pid_file)
 			return
+		except SystemExit:
+			raise
 		except Exception as exc:  # noqa: BLE001
+			reason["value"] = f"未捕获异常: {exc}"
 			logger.exception("监控循环出现异常: %s", exc)
+			logger.info("将在 10 秒后继续运行…")
+			time.sleep(10)
+			continue
 
-		time.sleep(max(1, args.interval))
+		sleep_seconds = max(1, args.interval)
+		before = time.time()
+		time.sleep(sleep_seconds)
+		if repairs.detect_sleep(logger, sleep_seconds, time.time() - before):
+			# 休眠后网络状态不可信，立刻重新判断
+			logger.info("系统休眠恢复，重置网络状态缓存并立即重新检测…")
+			last_online = None
 
 
 def main() -> None:
@@ -559,20 +865,31 @@ def main() -> None:
 	
 	interval = args.interval if args.interval is not None else config_data.get("interval", 10)
 	reconnect_timeout = args.reconnect_timeout if args.reconnect_timeout is not None else config_data.get("reconnect_timeout", 35)
-	log_file_str = args.log_file or config_data.get("log_file", str(DEFAULT_LOG_FILE))
+	log_file_str = args.log_file or config_data.get("log_file", DEFAULT_LOG_FILE.name)
 	log_max_bytes = args.log_max_bytes if args.log_max_bytes is not None else config_data.get("log_max_bytes", 2 * 1024 * 1024)
 	log_backup_count = args.log_backup_count if args.log_backup_count is not None else config_data.get("log_backup_count", 5)
-	state_file_str = args.state_file or config_data.get("state_file", str(DEFAULT_STATE_FILE))
+	state_file_str = args.state_file or config_data.get("state_file", DEFAULT_STATE_FILE.name)
+	pid_file_str = args.pid_file or config_data.get("pid_file", DEFAULT_PID_FILE.name)
+	heartbeat_interval = args.heartbeat_interval if args.heartbeat_interval is not None else int(config_data.get("heartbeat_interval", 60))
 	interface = args.interface or config_data.get("interface")
 	verbose = args.verbose or config_data.get("verbose", False)
 	
 	check_targets = args.check_target if args.check_target else config_data.get("check_targets", list(DEFAULT_CHECK_TARGETS))
 	preferred_profiles = args.preferred_profile if args.preferred_profile else config_data.get("preferred_profiles", [])
+	dns_check_hosts = config_data.get("dns_check_hosts", list(DEFAULT_DNS_HOSTS))
 
-	log_file = Path(log_file_str)
+	prevent_sleep = not getattr(args, "no_prevent_sleep", False) and config_data.get("prevent_sleep", True)
+	cleanup_proxy = not getattr(args, "no_cleanup_proxy", False) and config_data.get("cleanup_proxy_on_disconnect", True)
+	repair_dns = not getattr(args, "no_repair_dns", False) and config_data.get("repair_dns_on_failure", True)
+	adapter_reset = not getattr(args, "no_reset_adapter", False) and config_data.get("adapter_reset_on_failure", True)
+	wifi_recovery = not getattr(args, "no_wifi_recovery", False) and (args.wifi_recovery or config_data.get("wifi_recovery", True))
+
+	log_file = resolve_path(log_file_str)
 	log_file.parent.mkdir(parents=True, exist_ok=True)
-	state_file = Path(state_file_str)
+	state_file = resolve_path(state_file_str)
 	state_file.parent.mkdir(parents=True, exist_ok=True)
+	pid_file = resolve_path(pid_file_str)
+	pid_file.parent.mkdir(parents=True, exist_ok=True)
 
 	logger = configure_logging(log_file, verbose, log_max_bytes, log_backup_count)
 	ensure_windows(logger)
@@ -581,18 +898,35 @@ def main() -> None:
 	logger.info("日志文件: %s", log_file)
 	logger.info("日志轮换配置: 单个文件 %d MB，保留 %d 个备份", log_max_bytes // (1024 * 1024), log_backup_count)
 	logger.info("状态文件: %s", state_file)
+	logger.info("PID 文件: %s", pid_file)
+
+	if prevent_sleep and repairs.enable_sleep_guard(logger):
+		logger.info("已设置阻止系统休眠（显示器可关闭，系统保持运行）。")
+	elif not prevent_sleep:
+		logger.info("休眠阻止已禁用，系统可能按正常策略进入休眠。")
+
+	repairs.check_previous_crash(pid_file, logger, log_file)
 	
 	args.interval = interval
 	args.reconnect_timeout = reconnect_timeout
 	args.log_max_bytes = log_max_bytes
 	args.log_backup_count = log_backup_count
+	args.heartbeat_interval = max(1, heartbeat_interval)
 	args.check_target = check_targets
 	args.preferred_profile = preferred_profiles
+	args.dns_check_hosts = dns_check_hosts
 	args.disabled_profiles = config_data.get("disabled_profiles", [])
-	args.enabled_profiles = config_data.get("enabled_profiles")
+	args.enabled_profiles = args.allowed_profile or config_data.get("enabled_profiles")
+	args.dns_reset_interfaces = config_data.get("dns_reset_interfaces", [])
 	args.interface = interface
 	args.verbose = verbose
-	args.state_file = state_file_str
+	args.state_file = str(state_file)
+	args.pid_file = str(pid_file)
+	args.prevent_sleep = prevent_sleep
+	args.cleanup_proxy = cleanup_proxy
+	args.repair_dns = repair_dns
+	args.adapter_reset = adapter_reset
+	args.wifi_recovery = wifi_recovery
 	
 	output_startup_diagnostics(args, logger)
 	

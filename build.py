@@ -17,8 +17,11 @@ def main():
     build = ROOT / "build"
     build.mkdir(exist_ok=True)
     version_file = build / "version_info.txt"
+    core, _, prerelease = VERSION.partition("-")
+    revision = int(prerelease.rsplit(".", 1)[-1]) if prerelease else 0
+    windows_version = tuple(int(part) for part in core.split(".")) + (revision,)
     version_file.write_text(f'''VSVersionInfo(
-  ffi=FixedFileInfo(filevers=(0, 1, 0, 1), prodvers=(0, 1, 0, 1),
+  ffi=FixedFileInfo(filevers={windows_version}, prodvers={windows_version},
     mask=0x3f, flags=0x2, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('FileDescription', 'Network Guard'),
@@ -39,8 +42,12 @@ def main():
         cwd=ROOT, check=True, env=build_env)
     output = ROOT / "dist" / "NetworkGuard"
     shutil.copy2(ROOT / "README.md", output / "README.md")
+    if (ROOT / "LEGACY_REVIEW.md").exists():
+        shutil.copy2(ROOT / "LEGACY_REVIEW.md", output / "LEGACY_REVIEW.md")
     if (ROOT / "LICENSE").exists():
         shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
+    if (ROOT / "CHANGELOG.md").exists():
+        shutil.copy2(ROOT / "CHANGELOG.md", output / "CHANGELOG.md")
     archive = Path(shutil.make_archive(str(ROOT / "dist" / f"NetworkGuard-{VERSION}-windows-x64"),
                                       "zip", ROOT / "dist", "NetworkGuard"))
     with archive.open("rb") as stream:

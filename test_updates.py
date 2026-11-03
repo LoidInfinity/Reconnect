@@ -17,7 +17,7 @@ class UpdateTests(unittest.TestCase):
 
     def test_alpha_updates_and_drafts(self):
         releases = [dict(tag_name="v0.1.0-alpha.2", prerelease=True), dict(tag_name="v9.0.0", draft=True), dict(tag_name="bad")]
-        result = updates.select_release(releases)
+        result = updates.select_release(releases, "0.1.0-alpha.1")
         self.assertTrue(result["available"])
         self.assertEqual(result["latest"], "v0.1.0-alpha.2")
         self.assertTrue(result["url"].startswith(app_info.RELEASES_URL + "/tag/"))
@@ -25,7 +25,7 @@ class UpdateTests(unittest.TestCase):
 
     def test_empty_same_and_older(self):
         self.assertIsNone(updates.select_release([])["latest"])
-        for version in ("0.1.0-alpha.1", "0.0.9"):
+        for version in ("0.1.0-alpha.1", app_info.VERSION, "0.0.9"):
             self.assertFalse(updates.select_release([dict(tag_name=version)])["available"])
 
     def test_api_success_and_errors(self):

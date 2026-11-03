@@ -3,11 +3,29 @@ network_guard.log
 network_guard.log.*
 network_guard_state.txt
 network_guard_config.json
+network_guard_config.json.tmp
+network_guard.pid
+network-guard-*.jsonl
+
+# 旧版本归档（含旧日志/环境，仅本地保留）
+/test/
 
 # 本地 Python 环境
 .conda/
+.venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 本地凭据与环境配置
+.env
+.env.*
+!.env.example
 
 # 编辑器/系统
 .vscode/*
@@ -16,6 +34,6 @@ Thumbs.db
 desktop.ini
 
 # Packaging outputs
-build/
-dist/
+/build/
+/dist/
 *.spec

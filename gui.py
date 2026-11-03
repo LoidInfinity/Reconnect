@@ -35,14 +35,18 @@ def read_settings(path: Path) -> dict:
     defaults = dict(interval=10, reconnect_timeout=35,
                     check_targets=list(guard.DEFAULT_CHECK_TARGETS),
                     preferred_profiles=[], disabled_profiles=[], enabled_profiles=None, interface=None, verbose=False,
-                    log_file=str(guard.DEFAULT_LOG_FILE),
-                    state_file=str(guard.DEFAULT_STATE_FILE),
-                    log_max_bytes=2097152, log_backup_count=5)
+                    log_file=guard.DEFAULT_LOG_FILE.name,
+                    state_file=guard.DEFAULT_STATE_FILE.name,
+                    log_max_bytes=2097152, log_backup_count=5,
+                    heartbeat_interval=60, pid_file=guard.DEFAULT_PID_FILE.name,
+                    prevent_sleep=True, cleanup_proxy_on_disconnect=True,
+                    repair_dns_on_failure=True, dns_check_hosts=list(guard.DEFAULT_DNS_HOSTS), dns_reset_interfaces=[],
+                    wifi_recovery=True, adapter_reset_on_failure=True)
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError("配置文件必须是 JSON 对象")
-        defaults.update(data)
+        defaults.update(guard.migrate_config(data))
     return defaults
 
 
@@ -53,6 +57,7 @@ def validate_settings(data: dict) -> dict:
         ("reconnect_timeout", "重连超时", 1, 3600),
         ("log_max_bytes", "日志大小", 1, 1073741824),
         ("log_backup_count", "日志备份数", 0, 100),
+        ("heartbeat_interval", "心跳间隔", 1, 86400),
     ):
         try:
             value = int(str(data[key]))
@@ -61,8 +66,13 @@ def validate_settings(data: dict) -> dict:
         if not minimum <= value <= maximum:
             raise ValueError(f"{label}须在 {minimum}–{maximum} 之间")
         result[key] = value
-    data = dict(data, disabled_profiles=data.get("disabled_profiles", []))
-    for key in ("check_targets", "preferred_profiles", "disabled_profiles"):
+    for key in ("prevent_sleep", "cleanup_proxy_on_disconnect", "repair_dns_on_failure",
+                "wifi_recovery", "adapter_reset_on_failure"):
+        if not isinstance(data.get(key, True), bool):
+            raise ValueError(f"{key} 必须是 true 或 false")
+        result[key] = data.get(key, True)
+    data = dict(data, disabled_profiles=data.get("disabled_profiles", []), dns_reset_interfaces=data.get("dns_reset_interfaces", []))
+    for key in ("check_targets", "preferred_profiles", "disabled_profiles", "dns_check_hosts", "dns_reset_interfaces"):
         if not isinstance(data[key], list) or any(not isinstance(x, str) for x in data[key]):
             raise ValueError(f"{key} 必须是字符串列表")
         result[key] = list(dict.fromkeys(x.strip() for x in data[key] if x.strip()))
@@ -74,7 +84,7 @@ def validate_settings(data: dict) -> dict:
             raise ValueError(f"检测地址无效：{target}")
     if data.get("interface") is not None and not isinstance(data["interface"], str):
         raise ValueError("网卡名称必须是文字")
-    for key in ("log_file", "state_file"):
+    for key in ("log_file", "state_file", "pid_file"):
         if not isinstance(data[key], str) or not data[key].strip():
             raise ValueError(f"{key} 不能为空")
     enabled = data.get("enabled_profiles")
@@ -111,9 +121,9 @@ class EventLog(logging.Handler):
 def worker(config_path: Path) -> None:
     """An isolated process keeps slow network calls off the UI thread."""
     config = validate_settings(read_settings(config_path))
-    log_path = Path(config["log_file"])
+    log_path = guard.resolve_path(config["log_file"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path = Path(config["state_file"])
+    state_path = guard.resolve_path(config["state_file"])
     state_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(guard.APP_NAME)
     logger.setLevel(logging.DEBUG)
@@ -127,10 +137,30 @@ def worker(config_path: Path) -> None:
         handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"))
         logger.addHandler(handler)
     guard.ensure_windows(logger)
+    pid_file = guard.resolve_path(config["pid_file"])
+    with guard.repairs.monitor_session(logger, pid_file, log_path, config["prevent_sleep"]):
+        _monitor_worker(config_path, config, logger)
+
+
+def _monitor_worker(config_path, config, logger):
+    state_path = guard.resolve_path(config["state_file"])
     attempts = successes = 0
+    repair_stats = {"dns_repairs": 0, "proxy_cleanups": 0}
+    last_heartbeat = time.monotonic()
     logger.info("守护已启动，检测间隔 %s 秒", config["interval"])
+    logger.info("自动修复：代理清理 %s，DNS 修复 %s，Wi-Fi 重连 %s，网卡重置 %s",
+                "开" if config["cleanup_proxy_on_disconnect"] else "关",
+                "开" if config["repair_dns_on_failure"] else "关",
+                "开" if config["wifi_recovery"] else "关",
+                "开" if config["adapter_reset_on_failure"] else "关")
     while True:
         try:
+            now = time.monotonic()
+            if now - last_heartbeat >= config["heartbeat_interval"]:
+                logger.info("心跳：守护运行中，恢复成功 %d/%d", successes, attempts)
+                for handler in logger.handlers:
+                    handler.flush()
+                last_heartbeat = now
             emit("status", text="正在检测", tone="busy")
             online = guard.is_internet_reachable(logger, config["check_targets"])
             if not online:
@@ -139,20 +169,30 @@ def worker(config_path: Path) -> None:
                 config["disabled_profiles"] = participation["disabled_profiles"]
                 config["enabled_profiles"] = participation["enabled_profiles"] or []
                 attempts += 1
-                emit("status", text="正在恢复网络", tone="busy")
+                emit("status", text="正在修复网络", tone="busy")
                 online = guard.recover_network(logger, config["interface"],
                     config["preferred_profiles"], state_path,
                     config["reconnect_timeout"], config["check_targets"],
-                    disabled_profiles=config["disabled_profiles"], enabled_profiles=config["enabled_profiles"])
+                    disabled_profiles=config["disabled_profiles"],
+                    enabled_profiles=config["enabled_profiles"],
+                    cleanup_proxy=config["cleanup_proxy_on_disconnect"],
+                    repair_dns_enabled=config["repair_dns_on_failure"],
+                    dns_check_hosts=config["dns_check_hosts"],
+                    wifi_recovery=config["wifi_recovery"],
+                    adapter_reset=config["adapter_reset_on_failure"],
+                    dns_reset_interfaces=config["dns_reset_interfaces"], repair_stats=repair_stats)
                 successes += int(online)
             interfaces = guard.get_wifi_interfaces(logger, config["interface"])
-            emit("result", online=online, attempts=attempts, successes=successes,
+            emit("result", online=online, attempts=attempts, successes=successes, **repair_stats,
                  interfaces=[vars(item) for item in interfaces], checked=time.strftime("%H:%M:%S"))
             logger.info("本轮检测：%s", "网络可用" if online else "网络不可用")
         except Exception:
             logger.exception("检测发生异常，将在下一轮重试")
             emit("status", text="检测异常 · 请查看日志", tone="error")
+        before = time.time()
         time.sleep(config["interval"])
+        if guard.repairs.detect_sleep(logger, config["interval"], time.time() - before):
+            logger.info("系统休眠恢复，立即重新检测网络。")
 
 
 class GuardApp:
@@ -313,7 +353,22 @@ class GuardApp:
             self.fields[key] = widget
         self.verbose = tk.BooleanVar()
         ttk.Checkbutton(settings, text="显示调试日志", variable=self.verbose).grid(row=5, column=1, sticky="w")
-        ttk.Button(settings, text="保存设置", command=self.save).grid(row=6, column=1, sticky="e", pady=8)
+        recovery = ttk.Frame(settings)
+        recovery.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(recovery, text="断线自动修复（从轻到重依次尝试）",
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        self.switches = {}
+        for key, text in (
+            ("cleanup_proxy_on_disconnect", "清理系统代理（代理工具失效导致的应用层断网）"),
+            ("repair_dns_on_failure", "修复 DNS（清空缓存 + 网卡 DNS 回退自动获取）"),
+            ("wifi_recovery", "重连已保存的 Wi-Fi（有线环境可关闭）"),
+            ("adapter_reset_on_failure", "全部失败后禁用/启用网卡（需管理员权限）"),
+            ("prevent_sleep", "守护期间阻止系统休眠"),
+        ):
+            var = tk.BooleanVar()
+            self.switches[key] = var
+            ttk.Checkbutton(recovery, text=text, variable=var).pack(anchor="w")
+        ttk.Button(settings, text="保存设置", command=self.save).grid(row=7, column=1, sticky="e", pady=8)
         toolbar = ttk.Frame(logs)
         toolbar.pack(fill="x", pady=(0, 8))
         ttk.Label(toolbar, text="实时输出 · 最多显示 1500 行", foreground=MUTED).pack(side="left")
@@ -338,6 +393,8 @@ class GuardApp:
                 widget.delete("1.0", "end")
                 widget.insert("1.0", "\n".join(self.config[key]))
         self.verbose.set(self.config["verbose"])
+        for key, var in self.switches.items():
+            var.set(bool(self.config[key]))
 
     def save(self):
         data = dict(self.config)
@@ -345,6 +402,8 @@ class GuardApp:
             data[key] = widget.get().strip() if isinstance(widget, tk.StringVar) else widget.get("1.0", "end").splitlines()
         data["interface"] = data["interface"] or None
         data["verbose"] = self.verbose.get()
+        for key, var in self.switches.items():
+            data[key] = bool(var.get())
         try:
             data = validate_settings(data)
             save_settings(self.config_path, data)
@@ -452,6 +511,7 @@ class GuardApp:
             messagebox.showerror("无法启动", str(exc), parent=self.root)
             return
         process = self.process
+        self.worker_pid_file = guard.resolve_path(self.config["pid_file"])
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.set_status("正在启动", "busy")
@@ -591,8 +651,11 @@ class GuardApp:
                 self.set_status("网络可用 · 守护中" if event["online"] else "网络不可用 · 等待重试", "ok" if event["online"] else "error")
                 self.show_interfaces(event["interfaces"])
                 self.stats.configure(text=f"最近检测 {event['checked']}    |    本次恢复成功 {event['successes']} / {event['attempts']}")
+                self.stats.configure(text=self.stats.cget("text") + f"    |    DNS 修复 {event.get('dns_repairs', 0)} · 代理恢复 {event.get('proxy_cleanups', 0)}")
             elif kind == "exit":
                 stopped = self.stopping
+                if stopped and self.process:
+                    guard.repairs.remove_owned_pid_file(self.worker_pid_file, self.process.pid)
                 self.process = None
                 self.stopping = False
                 self.start_button.configure(state="normal")
