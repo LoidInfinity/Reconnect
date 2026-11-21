@@ -650,12 +650,13 @@ def remove_owned_pid_file(pid_file: Path, pid: int) -> None:
 
 
 @contextmanager
-def monitor_session(logger, pid_file: Path, log_file: Path, keep_awake: bool):
+def monitor_session(logger, pid_file: Path, log_file: Path, keep_awake: bool,
+                    log_offset: int | None = None):
     """Bookkeeping for GUI/background workers, including orderly cleanup."""
     import os
     import signal
 
-    check_previous_crash(pid_file, logger, log_file)
+    check_previous_crash(pid_file, logger, log_file, log_offset)
     write_pid_file(pid_file)
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     reason = "正常退出"
@@ -681,7 +682,48 @@ def monitor_session(logger, pid_file: Path, log_file: Path, keep_awake: bool):
         logger.info("守护会话退出：%s", reason)
 
 
-def check_previous_crash(pid_file: Path, logger, log_file: Path | None = None) -> bool:
+def log_size_before_startup(log_file: Path) -> int:
+    """Snapshot the log size *before* the current session writes anything.
+
+    Must be called before the log handler is opened. The value lets crash
+    replay stop at the end of the previous session, so startup diagnostics
+    written by this run are never mistaken for the crash tail.
+    """
+    try:
+        return log_file.stat().st_size if log_file.exists() else 0
+    except OSError:
+        return 0
+
+
+def _read_log_tail(path: Path, end: int | None, limit: int) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read() if end is None else handle.read(max(end, 0))
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return []
+    return text.splitlines()[-limit:]
+
+
+def previous_session_tail(log_file: Path, log_offset: int | None, limit: int = 15) -> list[str]:
+    """Return the last lines of the *previous* session only.
+
+    When ``log_offset`` is known, only bytes written before this run started
+    are considered. If the log rolled over right at startup, the previous
+    content now lives in the ``.1`` backup, so fall back to that file.
+    """
+    if log_offset is None:
+        return _read_log_tail(log_file, None, limit)
+    lines = _read_log_tail(log_file, log_offset, limit)
+    if lines:
+        return lines
+    return _read_log_tail(log_file.with_name(log_file.name + ".1"), None, limit)
+
+
+def check_previous_crash(pid_file: Path, logger, log_file: Path | None = None,
+                         log_offset: int | None = None) -> bool:
     """Detect a stale PID file and replay the tail of the previous log."""
     if not pid_file.exists():
         return False
@@ -704,12 +746,14 @@ def check_previous_crash(pid_file: Path, logger, log_file: Path | None = None) -
     logger.warning("⚠ 检测到上次运行异常退出！旧 PID: %s（进程已不存在，PID 文件残留）", old_pid)
     if log_file is not None and log_file.exists():
         try:
-            lines = log_file.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
-            tail = lines[-15:]
-            logger.warning("--- 崩溃前最后 %d 行日志 ---", len(tail))
-            for line in tail:
-                logger.warning("  %s", line)
-            logger.warning("--- 崩溃前日志结束 ---")
+            tail = previous_session_tail(log_file, log_offset)
+            if tail:
+                logger.warning("--- 上次会话最后 %d 行（以下行属于上一次运行，不是本次启动）---", len(tail))
+                for line in tail:
+                    logger.warning("  [上次] %s", line)
+                logger.warning("--- 上次会话日志结束 ---")
+            else:
+                logger.warning("--- 上次会话没有留下可用的日志尾部 ---")
         except Exception:  # noqa: BLE001
             pass
     remove_pid_file(pid_file)

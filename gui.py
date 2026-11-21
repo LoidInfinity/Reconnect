@@ -146,6 +146,9 @@ def worker(config_path: Path) -> None:
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     logger.propagate = False
+    # 必须在打开日志 handler 之前取样：崩溃回放只应包含上一次会话写入的内容，
+    # 否则本次启动写入的日志会被误当成"崩溃前的最后几行"。
+    startup_log_size = guard.repairs.log_size_before_startup(log_path)
     disk = RotatingFileHandler(log_path, maxBytes=config["log_max_bytes"],
                                backupCount=config["log_backup_count"], encoding="utf-8")
     live = EventLog()
@@ -155,7 +158,7 @@ def worker(config_path: Path) -> None:
         logger.addHandler(handler)
     guard.ensure_windows(logger)
     pid_file = guard.resolve_path(config["pid_file"])
-    with guard.repairs.monitor_session(logger, pid_file, log_path, config["prevent_sleep"]):
+    with guard.repairs.monitor_session(logger, pid_file, log_path, config["prevent_sleep"], startup_log_size):
         _monitor_worker(config_path, config, logger)
 
 

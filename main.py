@@ -258,6 +258,10 @@ def configure_logging(log_file: Path, verbose: bool, max_bytes: int = 2 * 1024 *
 
 	formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
+	# 必须在打开 handler 之前取样：崩溃回放只能包含上一次会话写入的内容，
+	# 否则本次启动的诊断日志会被误当成“崩溃前的最后几行”。
+	startup_log_offset = repairs.log_size_before_startup(log_file)
+
 	file_handler = RotatingFileHandler(
 		log_file,
 		maxBytes=max_bytes,
@@ -274,6 +278,7 @@ def configure_logging(log_file: Path, verbose: bool, max_bytes: int = 2 * 1024 *
 	logger.addHandler(file_handler)
 	logger.addHandler(console_handler)
 	logger.propagate = False
+	setattr(logger, "startup_log_offset", startup_log_offset)
 	return logger
 
 
@@ -1035,7 +1040,7 @@ def main() -> None:
 	elif not prevent_sleep:
 		logger.info("休眠阻止已禁用，系统可能按正常策略进入休眠。")
 
-	repairs.check_previous_crash(pid_file, logger, log_file)
+	repairs.check_previous_crash(pid_file, logger, log_file, getattr(logger, "startup_log_offset", None))
 	
 	args.interval = interval
 	args.reconnect_timeout = reconnect_timeout
