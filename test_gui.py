@@ -96,6 +96,15 @@ class WorkerTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
+    def setUp(self):
+        # CI runners without an interactive desktop cannot create a Tk window;
+        # skip instead of failing the release build.
+        try:
+            probe = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"当前环境无法创建 Tk 窗口: {exc}")
+        probe.destroy()
+
     def test_high_dpi_controls_are_not_clipped(self):
         for scaling in (1.333, 2.0, 2.667):
             with self.subTest(scaling=scaling), tempfile.TemporaryDirectory() as directory:

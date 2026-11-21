@@ -59,11 +59,22 @@ python main.py --verbose    # 控制台同时输出调试日志
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m unittest discover -p "test_*.py"   # 62 个用例
+python -m unittest discover -p "test_*.py"   # 73 个用例
 python build.py                              # 生成 dist/ 目录 + ZIP + SHA-256
 ```
 
-打包版无需安装 Python，解压后双击 `NetworkGuard.exe`，请保留同目录的 `_internal` 文件夹。发布者需在 GitHub 创建对应的 Release 并附上 ZIP，内置的“检查 GitHub 更新”才能发现新版本（仅推送代码或标签不算发布）。
+打包版无需安装 Python，解压后双击 `NetworkGuard.exe`，请保留同目录的 `_internal` 文件夹。
+
+### 发布新版本
+
+改好 `app_info.py` 里的 `VERSION` 与 `CHANGELOG.md`，提交后打标签推送：
+
+```powershell
+git tag -a v0.1.0-beta.2 -m "0.1.0-beta.2"
+git push origin v0.1.0-beta.2
+```
+
+`.github/workflows/release.yml` 会自动在 Windows 上跑测试、构建 ZIP 与 SHA-256，并创建 **预发行** Release（标签中含 `-beta`、`-alpha`、`-rc` 即判定为预发行）。标签必须与 `VERSION` 完全一致，否则工作流直接失败。程序内置的“检查 GitHub 更新”依赖这个 Release，只推送代码不算发布。
 
 ## 界面说明
 
