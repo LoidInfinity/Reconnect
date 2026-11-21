@@ -382,8 +382,16 @@ class GuardApp:
         ttk.Button(settings, text="保存设置", command=self.save).grid(row=7, column=1, sticky="e", pady=8)
         toolbar = ttk.Frame(logs)
         toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Label(toolbar, text="实时输出 · 最多显示 1500 行", foreground=MUTED).pack(side="left")
-        ttk.Button(toolbar, text="清空显示", command=self.clear_logs).pack(side="right")
+        ttk.Label(toolbar, text="实时输出", foreground=MUTED).pack(side="left")
+        ttk.Button(toolbar, text="清空", command=self.clear_logs).pack(side="right")
+        ttk.Button(toolbar, text="打包日志", command=self.export_logs).pack(side="right", padx=(0, 6))
+        self.support_hint = ttk.Label(
+            logs,
+            text=f"遇到问题？点“打包日志”，把生成的压缩包发送到 {guard.repairs.SUPPORT_EMAIL} 并描述具体情况。",
+            foreground=MUTED,
+        )
+        self.support_hint.pack(anchor="w", pady=(0, 6))
+        wrap_label(self.support_hint, logs, 40)
         self.log_text = tk.Text(logs, bg="#102139", fg="#d6e2f3", font=("Consolas", 10),
                                 width=24, height=10, wrap="word", relief="flat", state="disabled")
         scroll = ttk.Scrollbar(logs, command=self.log_text.yview)
@@ -607,6 +615,29 @@ class GuardApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+
+    def export_logs(self):
+        """Bundle recent logs into a ZIP the user can email to support."""
+        try:
+            config = read_settings(self.config_path)
+            log_path = guard.resolve_path(config["log_file"])
+            archive = guard.repairs.export_logs(log_path, VERSION)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("打包失败", str(exc), parent=self.root)
+            return
+        if archive is None:
+            messagebox.showinfo(
+                "打包日志",
+                "还没有生成日志文件。请先启动守护运行一段时间再打包。",
+                parent=self.root,
+            )
+            return
+        messagebox.showinfo(
+            "打包完成",
+            f"已生成：\n{archive}\n\n"
+            f"遇到问题请把该压缩包发送到 {guard.repairs.SUPPORT_EMAIL}，并描述具体情况。",
+            parent=self.root,
+        )
 
     def poll(self):
         for _ in range(200):

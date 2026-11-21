@@ -91,6 +91,7 @@ python build.py                              # 生成 dist/ 目录 + ZIP + SHA-2
 | `--no-prevent-sleep` | 不阻止系统休眠 |
 | `--heartbeat-interval 秒` | 心跳日志间隔 |
 | `--verbose` | 控制台输出调试日志 |
+| `--export-logs [目录]` | 把最近的日志打包成 ZIP 后退出 |
 | `--save-default-config` | 生成默认配置后退出 |
 
 默认先修有线再修无线；没有有线网卡时自动跳过。完整参数见 `python main.py --help`。
@@ -113,5 +114,16 @@ python build.py                              # 生成 dist/ 目录 + ZIP + SHA-2
 - 日志中的 SSID、AP BSSID、网卡物理地址与 GUID 会被替换为 `<redacted>` / `<mac>` / `<guid>`，界面仍正常显示。
 - 检测地址与 DNS 监测域名均为公共站点，不含个人或单位内部域名。
 - 配置、日志、状态、PID 均被 `.gitignore` 排除。需要版本化配置时请提交不含真实信息的 `network_guard_config.example.json`；真实配置中的 Wi-Fi 名称与内网地址不应入库。
+
+## 反馈问题
+
+遇到无法自动恢复的断网时，请把日志发来：
+
+- **界面** — 点日志栏的「打包日志」，生成 `NetworkGuard-logs-*.zip`
+- **终端** — 运行 `python main.py --export-logs`（可指定目录：`--export-logs D:\temp`）
+
+压缩包内含最近的日志（含轮转备份，已脱敏）和一份诊断说明，**不包含配置文件**（配置文件含个人 Wi-Fi 名称）。
+
+请将压缩包发送到 **1164275580@qq.com**，并在邮件里说明：什么时候断的、有线还是无线、能否自动恢复、是否重启过。
 
 如未读到 Wi-Fi 信息，请检查无线网卡、WLAN AutoConfig 服务，以及 Windows 对 Wi-Fi 信息的访问权限。

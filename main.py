@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import repairs
-from app_info import DATA_DIR
+from app_info import DATA_DIR, VERSION
 
 
 APP_NAME = "network_guard"
@@ -137,6 +137,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		"--save-default-config",
 		action="store_true",
 		help="生成默认配置文件并退出。",
+	)
+	parser.add_argument(
+		"--export-logs",
+		nargs="?",
+		const="",
+		default=None,
+		metavar="目录",
+		help=(
+			"把最近的日志打包成 ZIP 后退出（可指定输出目录）。"
+			f"反馈问题请将压缩包发送到 {repairs.SUPPORT_EMAIL} 并说明情况。"
+		),
 	)
 	parser.add_argument(
 		"--interval",
@@ -985,6 +996,19 @@ def main() -> None:
 
 	log_file = resolve_path(log_file_str)
 	log_file.parent.mkdir(parents=True, exist_ok=True)
+
+	# 打包日志不需要启动守护，也不需要创建日志文件，因此放在配置日志之前。
+	if args.export_logs is not None:
+		destination = resolve_path(args.export_logs) if args.export_logs else None
+		archive = repairs.export_logs(log_file, VERSION, destination)
+		if archive is None:
+			print(f"没有找到日志文件: {log_file}", file=sys.stderr)
+			print("请先运行一段时间，让程序产生日志后再打包。", file=sys.stderr)
+			sys.exit(1)
+		print(f"日志已打包: {archive}")
+		print(f"遇到问题请把该压缩包发送到 {repairs.SUPPORT_EMAIL}，并描述具体情况。")
+		return
+
 	state_file = resolve_path(state_file_str)
 	state_file.parent.mkdir(parents=True, exist_ok=True)
 	pid_file = resolve_path(pid_file_str)

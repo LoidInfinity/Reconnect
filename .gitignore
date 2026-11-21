@@ -11,6 +11,8 @@ network_guard_config.json.tmp
 network_guard*.json.tmp
 network-guard-*.jsonl
 *.jsonl
+# 打包的日志压缩包（含日志正文，仅供发送给支持邮箱）
+NetworkGuard-logs-*.zip
 
 # 允许提交的配置模板（不含任何真实信息）
 !network_guard_config.example.json

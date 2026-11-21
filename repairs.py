@@ -746,3 +746,95 @@ def install_signal_handlers(logger, pid_file: Path, set_reason: Callable[[str], 
                 signal.signal(sig, _handler)
             except (ValueError, OSError):  # not main thread / unsupported
                 pass
+
+
+# ------------------------------------------------------------- log bundling
+
+# Where users should send a bundle when they ask for help.
+SUPPORT_EMAIL = "1164275580@qq.com"
+
+
+def collect_log_files(log_file: Path, max_files: int = 20) -> list[Path]:
+    """Current log plus rotated backups (``x.log``, ``x.log.1`` ...), newest first.
+
+    Only files whose suffix after the log name is numeric are treated as
+    backups, so an unrelated ``x.log.bak`` is ignored.
+    """
+    directory = log_file.parent
+    if not directory.is_dir():
+        return []
+    stem = log_file.name
+    found: list[Path] = []
+    for item in directory.iterdir():
+        if not item.is_file():
+            continue
+        if item.name == stem or (
+            item.name.startswith(stem + ".") and item.name[len(stem) + 1:].isdigit()
+        ):
+            found.append(item)
+    found.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return found[:max_files]
+
+
+def export_logs(log_file: Path, version: str = "", destination: Path | None = None,
+                max_files: int = 20) -> Path | None:
+    """Bundle recent logs plus a diagnostics sheet into one ZIP.
+
+    Log lines are already redacted when written (SSID / BSSID / MAC / GUID
+    become placeholders), so the archive is safe to hand to support. The
+    configuration file is deliberately excluded: it holds personal Wi-Fi
+    profile names and internal addresses.
+
+    Returns the archive path, or ``None`` when no log file exists yet.
+    """
+    import platform
+    import zipfile
+    from datetime import datetime
+
+    files = collect_log_files(log_file, max_files)
+    if not files:
+        return None
+
+    target_dir = destination or log_file.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive = target_dir / f"NetworkGuard-logs-{stamp}.zip"
+    # 同一秒内连续打包时追加序号，避免静默覆盖上一次的结果。
+    sequence = 2
+    while archive.exists():
+        archive = target_dir / f"NetworkGuard-logs-{stamp}-{sequence}.zip"
+        sequence += 1
+
+    total_kb = sum(item.stat().st_size for item in files) / 1024
+    note = [
+        "# Network Guard 日志包",
+        "",
+        f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"版本: {version or '未知'}",
+        f"操作系统: {platform.system()} {platform.release()}",
+        f"Python: {sys.version.split()[0]}",
+        f"日志文件数: {len(files)}（合计 {total_kb:.0f} KB，新的在前）",
+        "",
+        "包含的日志:",
+        *(
+            f"  - {item.name}  ({item.stat().st_size / 1024:.0f} KB)"
+            for item in files
+        ),
+        "",
+        "日志已自动脱敏：SSID、BSSID、网卡物理地址与 GUID 已替换为占位符。",
+        "配置文件未打包（可能含个人 Wi-Fi 名称）。",
+        "",
+        "常见线索:",
+        "  - 出现“错误 1220” → WLAN AutoConfig 服务(wlansvc)异常或网卡正在重置",
+        "  - 出现“未检测到有线网卡”或 IP 为 169.254.x.x → DHCP 未下发地址",
+        "  - 出现“已改用 PowerShell 识别到” → netsh 查询挂起，已自动回退",
+        "  - 出现“已有另一个守护实例” → 重复启动被单实例锁拦下",
+        "",
+        f"反馈问题时请描述现象，并把本压缩包发送至 {SUPPORT_EMAIL}。",
+    ]
+
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("README.txt", "\n".join(note) + "\n")
+        for item in files:
+            bundle.write(item, arcname=item.name)
+    return archive
