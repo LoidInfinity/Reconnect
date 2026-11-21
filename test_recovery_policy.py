@@ -40,6 +40,10 @@ class RecoveryPolicyTests(unittest.TestCase):
                 http = stack.enter_context(patch.object(main, "http_reachable", side_effect=[False, False, True]))
                 ping = stack.enter_context(patch.object(main, "ping_reachable", return_value=True))
                 stack.enter_context(patch.object(repairs, "check_dns_resolution", return_value=[]))
+                # No wired adapter present, so the wireless path is exercised.
+                stack.enter_context(patch.object(repairs, "get_physical_adapters", return_value=[]))
+                # The single-instance lock is covered by test_single_instance.
+                stack.enter_context(patch.object(repairs, "acquire_single_instance", return_value=True))
                 dns = stack.enter_context(patch.object(repairs, "repair_dns"))
                 proxy = stack.enter_context(patch.object(repairs, "clear_proxy_settings", return_value=False))
                 stack.enter_context(patch.object(main, "get_wifi_interfaces", return_value=[]))

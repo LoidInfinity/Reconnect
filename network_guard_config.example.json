@@ -1,0 +1,33 @@
+{
+  "interval": 10,
+  "reconnect_timeout": 60,
+  "check_targets": [
+    "https://www.todesk.com",
+    "https://sunlogin.oray.com",
+    "https://www.awesun.com"
+  ],
+  "preferred_profiles": [],
+  "disabled_profiles": [],
+  "enabled_profiles": null,
+  "interface": null,
+  "log_file": "network_guard.log",
+  "log_max_bytes": 2097152,
+  "log_backup_count": 15,
+  "state_file": "network_guard_state.txt",
+  "pid_file": "network_guard.pid",
+  "heartbeat_interval": 60,
+  "prevent_sleep": true,
+  "cleanup_proxy_on_disconnect": true,
+  "repair_dns_on_failure": true,
+  "dns_check_hosts": [
+    "www.todesk.com",
+    "sunlogin.oray.com",
+    "www.awesun.com"
+  ],
+  "dns_reset_interfaces": [],
+  "wired_recovery": true,
+  "wired_reset_on_failure": true,
+  "wifi_recovery": true,
+  "adapter_reset_on_failure": true,
+  "verbose": false
+}

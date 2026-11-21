@@ -111,6 +111,8 @@ def save_default_config(config_file: Path) -> None:
 		"repair_dns_on_failure": True,
 		"dns_check_hosts": list(DEFAULT_DNS_HOSTS),
 		"wifi_recovery": True,
+		"wired_recovery": True,
+		"wired_reset_on_failure": True,
 		"adapter_reset_on_failure": True,
 		"verbose": False,
 	}
@@ -221,7 +223,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--no-wifi-recovery",
 		action="store_true",
-		help="只做代理/DNS 修复，不重连 Wi-Fi（有线环境建议加此参数）。",
+		help="只做代理/DNS/有线修复，不重连 Wi-Fi。",
+	)
+	parser.add_argument(
+		"--no-wired-recovery",
+		action="store_true",
+		help="断网时不检查/修复有线连接（默认优先修复有线，再尝试无线）。",
 	)
 	parser.add_argument("--allowed-profile", action="append", default=[], help="兼容旧版：仅允许指定 Wi-Fi 配置参与恢复，可重复。")
 	parser.add_argument("--wifi-recovery", action="store_true", help="兼容旧版：启用 Wi-Fi 恢复。")
@@ -418,11 +425,51 @@ def extract_value(text: str, labels: Iterable[str]) -> str | None:
 	return None
 
 
+def wifi_interfaces_from_powershell(logger: logging.Logger) -> list[WifiInterface]:
+	"""Wi-Fi adapters seen through PowerShell, which does not use wlansvc.
+
+	Used only as a fallback: ``netsh wlan show interfaces`` blocks while the
+	driver is resetting (MAC reads as ``00:00:00:00:00:00``, state "正在断开连接")
+	or when wlansvc is unhealthy. This path cannot report the SSID, but it does
+	prove the adapter exists and shows whether it holds a usable address.
+	"""
+	fallback: list[WifiInterface] = []
+	for item in repairs.get_physical_adapters(logger):
+		if repairs.is_wired(item):
+			continue
+		fallback.append(
+			WifiInterface(
+				name=str(item.get("Name") or ""),
+				state=str(item.get("Status") or "Unknown"),
+				ssid=None,
+				bssid=None,
+				signal=None,
+			)
+		)
+	return fallback
+
+
 def get_wifi_interfaces(logger: logging.Logger, interface_name: str | None) -> list[WifiInterface]:
-	completed = run_command(["netsh", "wlan", "show", "interfaces"], logger)
+	completed = run_command(["netsh", "wlan", "show", "interfaces"], logger, timeout=10)
+	interfaces: list[WifiInterface] = []
 	if completed.returncode != 0:
-		return []
-	interfaces = parse_wifi_interfaces(completed.stdout or "")
+		logger.debug("netsh 查询 Wi-Fi 接口失败（返回码 %s），可能是 wlansvc 异常或网卡正在重置",
+			completed.returncode)
+	else:
+		interfaces = parse_wifi_interfaces(completed.stdout or "")
+		if not interfaces:
+			raw = (completed.stdout or "").strip().replace("\n", " | ")
+			logger.debug("netsh 输出无法解析出 Wi-Fi 接口: %s", raw[:200] or "(空)")
+	if not interfaces:
+		# netsh 依赖 wlansvc，驱动重置期间会挂起或报错；PowerShell 仍能读到网卡。
+		interfaces = wifi_interfaces_from_powershell(logger)
+		if interfaces:
+			logger.warning(
+				"netsh 未能读取 Wi-Fi 接口（可能 wlansvc 异常或网卡正在重置），"
+				"已改用 PowerShell 识别到 %d 个无线网卡: %s",
+				len(interfaces),
+				"; ".join(f"{item.name}={item.state}" for item in interfaces),
+			)
 	if interface_name:
 		interfaces = [item for item in interfaces if item.name.casefold() == interface_name.casefold()]
 	logger.debug("识别到 Wi-Fi 网卡: %s", interfaces)
@@ -430,8 +477,9 @@ def get_wifi_interfaces(logger: logging.Logger, interface_name: str | None) -> l
 
 
 def get_saved_profiles(logger: logging.Logger) -> list[str]:
-	completed = run_command(["netsh", "wlan", "show", "profiles"], logger)
+	completed = run_command(["netsh", "wlan", "show", "profiles"], logger, timeout=10)
 	if completed.returncode != 0:
+		logger.debug("netsh 查询已保存配置失败（返回码 %s）", completed.returncode)
 		return []
 	profiles: list[str] = []
 	text = completed.stdout or ""
@@ -524,6 +572,10 @@ def choose_profiles_to_try(
 	enabled_profiles: list[str] | None = None,
 ) -> list[str]:
 	disabled = {p.casefold() for p in (disabled_profiles or [])}
+	# netsh 查询失败（wlansvc 异常/驱动重置）时拿不到已保存列表，
+	# 退回用户配置的参与名单，至少还能尝试连接。
+	if not saved_profiles and enabled_profiles:
+		saved_profiles = [p for p in enabled_profiles if p]
 	saved_profiles = [p for p in saved_profiles if p.casefold() not in disabled]
 	if enabled_profiles is not None:
 		enabled = {p.casefold() for p in enabled_profiles}
@@ -568,13 +620,18 @@ def recover_network(
 	dns_check_hosts: Iterable[str] | None = None,
 	wifi_recovery: bool = True,
 	adapter_reset: bool = False,
+	wired_recovery: bool = True,
+	wired_reset: bool = False,
 	dns_reset_interfaces: Iterable[str] | None = None,
 	repair_stats: dict[str, int] | None = None,
 ) -> bool:
-	"""按"DNS → 系统代理 → Wi-Fi 重连 → 网卡重置"的顺序修复，从轻到重。
+	"""按"DNS → 系统代理 → 有线连接 → Wi-Fi 重连 → 网卡重置"的顺序修复。
+
+	有线优先：全部连接失效时先修有线（DHCP 续约 → 必要时重置网卡），
+	再尝试无线。有线存在不会跳过无线：有线链路修好后 HTTP 仍不可用
+	时继续往下走，因为插着网线不代表能上网。
 
 	ping 成功只说明 ICMP 可达，不能证明 HTTP 或远控流量正常。
-	应用层修复后 HTTP 仍失败时，继续按参与恢复名单尝试 Wi-Fi 重连。
 	"""
 	repaired = False
 
@@ -615,6 +672,37 @@ def recover_network(
 		if is_internet_reachable(logger, check_targets):
 			logger.info("✓ 应用层修复后网络已恢复。")
 			return True
+
+	# 3) 有线连接优先：全部连接失效时先检查/修复有线，再尝试无线。
+	#    典型故障是"网线插着但 DHCP 没给 IPv4 地址"（169.254.x.x），
+	#    这种情况重置 DNS 治不好，必须重新获取租约。
+	wired_healthy_at_entry = False
+	if wired_recovery:
+		adapters = repairs.get_physical_adapters(logger)
+		wired = [item for item in adapters if repairs.is_wired(item)]
+		wired_healthy_at_entry = any(repairs.is_link_healthy(item) for item in wired)
+		if wired_healthy_at_entry:
+			logger.info("有线连接健康（已获得有效 IP 与网关）。")
+		elif wired:
+			if repairs.repair_wired_links(logger, allow_reset=wired_reset, adapters=adapters):
+				if repair_stats is not None:
+					repair_stats["wired_repairs"] = repair_stats.get("wired_repairs", 0) + 1
+				if is_internet_reachable(logger, check_targets):
+					logger.info("✓ 有线连接修复后网络已恢复。")
+					return True
+				logger.warning("有线链路已修复但 HTTP 仍不可用，继续尝试无线连接。")
+			else:
+				logger.warning("有线连接修复未成功，继续尝试无线连接。")
+		else:
+			logger.info("未检测到有线网卡，直接尝试无线连接。")
+	else:
+		logger.info("有线连接修复已禁用，跳过。")
+
+	# 有线本来就能正常上网时绝不动无线：重连 Wi-Fi 会抢占默认路由，
+	# 可能主动打断一条本来正常的连接。只有全部失效时才往下走无线。
+	if wired_healthy_at_entry:
+		logger.info("有线连接可用，已跳过无线重连以避免中断现有网络。")
+		return False
 
 	if not wifi_recovery:
 		logger.info("Wi-Fi 重连恢复已禁用，跳过。")
@@ -750,6 +838,13 @@ def output_startup_diagnostics(args: argparse.Namespace, logger: logging.Logger)
 
 
 def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
+	# 单实例保护：命名互斥量比 PID 文件可靠，进程崩溃时内核会自动释放。
+	# CLI 与 GUI 后台 worker 共用同一把锁，保证同一时间只有一个守护在操作网络。
+	if not repairs.acquire_single_instance("Monitor"):
+		logger.error("⛔ 已有另一个守护实例在运行，本次启动已取消。请先停止已有实例。")
+		print("已有一个 Network Guard 守护实例在运行，本次启动已取消。", file=sys.stderr)
+		raise SystemExit(2)
+
 	state_file = Path(args.state_file)
 	pid_file = Path(args.pid_file)
 	check_targets = list(dict.fromkeys(args.check_target or list(DEFAULT_CHECK_TARGETS)))
@@ -765,7 +860,7 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 	repairs.register_exit_handler(logger, pid_file, lambda: reason["value"])
 
 	last_online = None
-	recovery_stats = {"attempts": 0, "successes": 0, "failures": 0, "dns_repairs": 0, "proxy_cleanups": 0}
+	recovery_stats = {"attempts": 0, "successes": 0, "failures": 0, "dns_repairs": 0, "proxy_cleanups": 0, "wired_repairs": 0}
 	last_heartbeat = time.time()
 
 	while True:
@@ -807,6 +902,8 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 					dns_check_hosts=dns_check_hosts,
 					wifi_recovery=args.wifi_recovery,
 					adapter_reset=args.adapter_reset,
+					wired_recovery=getattr(args, "wired_recovery", True),
+					wired_reset=getattr(args, "wired_reset", False),
 					dns_reset_interfaces=getattr(args, "dns_reset_interfaces", []),
 					repair_stats=recovery_stats,
 				)
@@ -815,7 +912,7 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 					recovery_stats["successes"] += 1
 					success_rate = 100 * recovery_stats["successes"] / recovery_stats["attempts"]
 					logger.info("恢复成功率统计: %d/%d (%.1f%%)", recovery_stats["successes"], recovery_stats["attempts"], success_rate)
-					logger.info("分项统计：DNS 修复 %d 次，代理清理后恢复 %d 次", recovery_stats["dns_repairs"], recovery_stats["proxy_cleanups"])
+					logger.info("分项统计：DNS 修复 %d 次，代理清理后恢复 %d 次，有线修复后恢复 %d 次", recovery_stats["dns_repairs"], recovery_stats["proxy_cleanups"], recovery_stats.get("wired_repairs", 0))
 				else:
 					recovery_stats["failures"] += 1
 					failure_rate = 100 * recovery_stats["failures"] / recovery_stats["attempts"]
@@ -883,6 +980,8 @@ def main() -> None:
 	repair_dns = not getattr(args, "no_repair_dns", False) and config_data.get("repair_dns_on_failure", True)
 	adapter_reset = not getattr(args, "no_reset_adapter", False) and config_data.get("adapter_reset_on_failure", True)
 	wifi_recovery = not getattr(args, "no_wifi_recovery", False) and (args.wifi_recovery or config_data.get("wifi_recovery", True))
+	wired_recovery = not getattr(args, "no_wired_recovery", False) and config_data.get("wired_recovery", True)
+	wired_reset = adapter_reset and config_data.get("wired_reset_on_failure", True)
 
 	log_file = resolve_path(log_file_str)
 	log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -893,6 +992,13 @@ def main() -> None:
 
 	logger = configure_logging(log_file, verbose, log_max_bytes, log_backup_count)
 	ensure_windows(logger)
+
+	# 单实例预检查：放在耗时的启动诊断（netsh 可能超时 10 秒）之前，
+	# 这样重复启动能立刻失败退出，而不是等一轮网络探测。
+	if not repairs.acquire_single_instance("Monitor"):
+		logger.error("⛔ 已有另一个守护实例在运行，本次启动已取消。请先停止已有实例。")
+		print("已有一个 Network Guard 守护实例在运行，本次启动已取消。", file=sys.stderr)
+		sys.exit(2)
 
 	logger.info("配置文件: %s", config_file)
 	logger.info("日志文件: %s", log_file)
@@ -923,6 +1029,8 @@ def main() -> None:
 	args.state_file = str(state_file)
 	args.pid_file = str(pid_file)
 	args.prevent_sleep = prevent_sleep
+	args.wired_recovery = wired_recovery
+	args.wired_reset = wired_reset
 	args.cleanup_proxy = cleanup_proxy
 	args.repair_dns = repair_dns
 	args.adapter_reset = adapter_reset

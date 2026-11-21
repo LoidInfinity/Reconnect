@@ -75,6 +75,7 @@ class WorkerTests(unittest.TestCase):
             events = []
             try:
                 with patch.object(gui.guard, "ensure_windows"), \
+                     patch.object(gui.guard.repairs, "acquire_single_instance", return_value=True), \
                      patch.object(gui.guard, "is_internet_reachable", return_value=False), \
                      patch.object(gui.guard, "recover_network", return_value=True) as recover, \
                      patch.object(gui.guard, "get_wifi_interfaces", return_value=[]), \

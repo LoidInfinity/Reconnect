@@ -22,10 +22,13 @@ Windows Wi-Fi 自动恢复工具，提供中文桌面界面和命令行入口。
 
 1. **DNS 修复**：探测配置的域名，解析失败时清空 DNS 缓存并把网卡 DNS 回退为 DHCP 自动获取。
 2. **系统代理清理**：FlClash / Clash / Mihomo 等本地代理退出后，Windows 仍把请求发往已失效的端口，导致 ping 通但应用断网。此步关闭系统代理开关（`ProxyEnable=0`、清空 PAC）并广播设置变更。
-3. **Wi-Fi 重连**：按“上次成功 → 首选 → 其他已保存”的顺序尝试连接，受重连超时限制。
-4. **网卡重置**：不限制参与恢复的 Wi-Fi 配置时，全部失败后尝试禁用再启用网卡。存在参与名单或禁用名单时跳过此步，避免 Windows 自动连接被排除的 Wi-Fi。
+3. **有线连接修复（优先）**：全部连接失效时先检查有线网卡。典型故障是“网线插着但 DHCP 没下发地址”，此时 IPv4 会回退为 `169.254.x.x`（APIPA）且没有默认网关——重置 DNS 治不好，必须执行 `ipconfig /release` + `/renew` 重新获取租约；仍无有效租约且允许时重置该有线网卡。虚拟网卡（VMware/Hyper-V/WSL 等）不参与判断，避免它们常驻 Up 掩盖真实故障。
+4. **Wi-Fi 重连**：仅在有线不可用时执行（无有线网卡，或修复后链路仍不健康）。**有线能正常工作就绝不碰无线**——重连 Wi-Fi 会抢占默认路由，可能主动打断一条本来正常的连接。按“上次成功 → 首选 → 其他已保存”的顺序尝试连接，受重连超时限制。
+5. **无线网卡重置**：不限制参与恢复的 Wi-Fi 配置时，全部失败后尝试禁用再启用网卡。存在参与名单或禁用名单时跳过此步，避免 Windows 自动连接被排除的 Wi-Fi。
 
-**Ping 成功不会阻止网络恢复**：HTTP 检测失败时先修复 DNS／代理，HTTP 仍失败则继续尝试参与名单内的 Wi-Fi（需启用 Wi-Fi 恢复）。代理清理与网卡重置各有冷却时间（分别为 60 秒、300 秒）。第 4 步需要管理员权限，无权限时会记录失败原因。
+**原则：能上网就什么都不做。** 检测到 HTTP 可用时不会执行任何网络操作；有线链路已经健康（有有效 IP 与网关）时也不会重连无线，只在所有连接都失效时才从有线开始逐级尝试。
+
+**Ping 成功不会阻止网络恢复**：HTTP 检测失败时先修复 DNS／代理，再修复有线，最后才尝试参与名单内的 Wi-Fi（需启用对应开关）。代理清理与网卡重置各有冷却时间（分别为 60 秒、300 秒）。第 5 步与有线网卡重置需要管理员权限，无权限时会记录失败原因。
 
 联网判定以 HTTP(S) 结果为准，ping 只用来区分“链路断了”和“链路正常但应用层坏了”。因为代理失效时 ping 依然通，用 ping 判定会漏报。
 
@@ -37,6 +40,7 @@ Windows Wi-Fi 自动恢复工具，提供中文桌面界面和命令行入口。
 - **休眠检测**：等待时间远超预期时判定发生过系统休眠，立即重置网络状态重新检测；守护默认阻止系统休眠（显示器仍可关闭）。
 - **崩溃检测**：启动时若发现残留 PID 文件，说明上次异常退出，会回放崩溃前最后 15 行日志并记录退出原因。
 - **命令超时**：`netsh` 卡在驱动层时 `kill()` 不返回，因此命令等待由守护线程限时，超时即放弃等待，主循环不会被拖死。
+- **网卡识别回退**：`netsh wlan show interfaces` 依赖 WLAN AutoConfig 服务，网卡正在重置（MAC 显示 `00:00:00:00:00:00`、状态“正在断开连接”）或服务异常时会挂起或报错。此时程序改用 PowerShell（不依赖 wlansvc）识别网卡，日志会说明“已改用 PowerShell 识别到 N 个无线网卡”，避免误报“未识别到 Wi-Fi 网卡”。该回退能确认网卡存在与地址状态，但拿不到 SSID。
 
 ## 构建与测试
 
@@ -44,7 +48,7 @@ Windows Wi-Fi 自动恢复工具，提供中文桌面界面和命令行入口。
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m unittest -v test_gui test_updates test_repairs test_legacy_compat test_recovery_policy
+python -m unittest -v test_gui test_updates test_repairs test_legacy_compat test_recovery_policy test_wired_recovery
 python build.py
 ```
 
@@ -63,7 +67,7 @@ python build.py
 - **启动守护 / 停止守护**：启动后定期检测网络，断线时自动尝试修复。停止或关闭窗口会结束该窗口启动的守护进程。
 - **已保存的 Wi-Fi**：刷新配置及网卡状态，将所选配置设为首选。程序不会读取或展示 Wi-Fi 密码。
 - **参与恢复开关**：首次读取 Wi-Fi 列表时，仅当前已连接的配置默认参与恢复，其他配置默认不参与；未连接或无法识别当前配置时全部不参与。点击每条 Wi-Fi 右侧的“☑ 使用 / ☐ 不使用”（也可选中后按空格）自动保存选择。刷新、重启会保留已保存的选择，新发现的配置默认不参与。关闭的配置即使是首选或上次成功连接，也会跳过；全部关闭时不会发起 Wi-Fi 连接。GUI 守护从下一轮恢复读取开关，当前已开始的恢复轮次不受影响；命令行在下次启动时读取配置。升级旧版配置时按当前连接初始化，保留原有明确禁用项；允许参与的配置保存于 `enabled_profiles`。
-- **守护设置**：编辑检测间隔、重连超时、网卡、首选配置和检测地址，并开关四类自动修复（清理系统代理、修复 DNS、重连 Wi-Fi、失败后重置网卡）与“守护期间阻止系统休眠”。首次启动守护时自动保存配置；运行中修改设置需停止并重新启动守护。
+- **守护设置**：编辑检测间隔、重连超时、网卡、首选配置和检测地址，并开关五类自动修复（清理系统代理、修复 DNS、修复有线连接、重连 Wi-Fi、失败后重置网卡）与“守护期间阻止系统休眠”。首次启动守护时自动保存配置；运行中修改设置需停止并重新启动守护。
 - **运行日志**：查看实时输出；“清空显示”仅清空界面，不删除磁盘日志。
 
 打开界面只读取 Wi-Fi 信息，点击“启动守护”后才会检测和自动修复。网络可用性包含有线网络；网卡信息单独显示 Wi-Fi 状态。
@@ -72,17 +76,29 @@ python build.py
 
 ## 命令行
 
+无需图形界面时用终端模式：双击 `start_cli.bat`，或运行：
+
+```powershell
+python main.py                       # 前台运行，Ctrl+C 停止
+python main.py --verbose             # 同时在控制台输出调试日志
+python main.py --no-wifi-recovery     # 只用代理/DNS/有线修复，不重连 Wi-Fi
+python main.py --no-wired-recovery    # 不检查有线（仅无线环境）
+```
+
+无图形界面、适合服务器或开机脚本：日志同时写入 `network_guard.log`。完整参数：
+
 ```powershell
 python main.py --save-default-config
 python main.py
-python main.py --no-wifi-recovery        # 只用代理/DNS 修复，不重连 Wi-Fi（有线环境）
 python main.py --no-cleanup-proxy --no-repair-dns   # 关闭对应修复步骤
-python main.py --no-prevent-sleep --heartbeat-interval 120
+python main.py --no-reset-adapter --no-prevent-sleep --heartbeat-interval 120
 ```
 
-命令行参数会覆盖配置文件中的同名项：`--interval`、`--reconnect-timeout`、`--check-target`、`--preferred-profile`、`--interface`、`--log-file`、`--log-max-bytes`、`--log-backup-count`、`--state-file`、`--pid-file`、`--heartbeat-interval`、`--no-prevent-sleep`、`--no-cleanup-proxy`、`--no-repair-dns`、`--no-reset-adapter`、`--no-wifi-recovery`、`--verbose`。
+命令行参数会覆盖配置文件中的同名项：`--interval`、`--reconnect-timeout`、`--check-target`、`--preferred-profile`、`--interface`、`--log-file`、`--log-max-bytes`、`--log-backup-count`、`--state-file`、`--pid-file`、`--heartbeat-interval`、`--no-prevent-sleep`、`--no-cleanup-proxy`、`--no-repair-dns`、`--no-reset-adapter`、`--no-wired-recovery`、`--no-wifi-recovery`、`--verbose`。
 
-GUI 与命令行是独立实例。使用 GUI 前请停止其他正在运行的守护实例，避免并行恢复。
+有线与无线环境均可使用：默认先修有线再修无线；没有有线网卡时自动跳过有线步骤，完全插网线但关闭 Wi-Fi 的机器可加 `--no-wifi-recovery`，只用 Wi-Fi 的机器可加 `--no-wired-recovery`。
+
+GUI 与命令行共用同一把单实例锁：同一时间只允许一个守护在操作网络。已有实例在运行时，新启动的 CLI 会直接退出（返回码 2），GUI 的“启动守护”会提示已有实例；重复双击 GUI 也只会保留一个窗口。这一保护使用 Windows 命名互斥量（`Local\NetworkGuard.Monitor` / `Local\NetworkGuard.Gui`），进程崩溃时由内核自动释放，不会像 PID 文件那样残留导致下次无法启动。
 
 ## 管理员自启
 
@@ -92,7 +108,7 @@ GUI 与命令行是独立实例。使用 GUI 前请停止其他正在运行的�
 
 - 磁盘日志会把 SSID、AP BSSID、网卡物理地址与 GUID 替换为 `<redacted>` / `<mac>` / `<guid>`，界面仍正常显示这些信息。
 - 默认检测地址与 DNS 监测域名均为公共站点，不含个人或单位内部域名。
-- 配置、日志、状态、PID 文件默认被 `.gitignore` 排除，不随仓库分发。
+- 配置、日志、状态、PID 文件默认被 `.gitignore` 排除，不随仓库分发。需要版本化配置时提交不含真实信息的 `network_guard_config.example.json` 模板；真实配置文件里的 Wi-Fi 名称、内网地址不应入库。
 
 如果没有读到 Wi-Fi 信息，请检查无线网卡、WLAN AutoConfig 服务，以及 Windows 对 Wi-Fi 信息的访问权限。
 

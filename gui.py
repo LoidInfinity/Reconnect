@@ -41,6 +41,7 @@ def read_settings(path: Path) -> dict:
                     heartbeat_interval=60, pid_file=guard.DEFAULT_PID_FILE.name,
                     prevent_sleep=True, cleanup_proxy_on_disconnect=True,
                     repair_dns_on_failure=True, dns_check_hosts=list(guard.DEFAULT_DNS_HOSTS), dns_reset_interfaces=[],
+                    wired_recovery=True, wired_reset_on_failure=True,
                     wifi_recovery=True, adapter_reset_on_failure=True)
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -67,6 +68,7 @@ def validate_settings(data: dict) -> dict:
             raise ValueError(f"{label}须在 {minimum}–{maximum} 之间")
         result[key] = value
     for key in ("prevent_sleep", "cleanup_proxy_on_disconnect", "repair_dns_on_failure",
+                "wired_recovery", "wired_reset_on_failure",
                 "wifi_recovery", "adapter_reset_on_failure"):
         if not isinstance(data.get(key, True), bool):
             raise ValueError(f"{key} 必须是 true 或 false")
@@ -120,6 +122,11 @@ class EventLog(logging.Handler):
 
 def worker(config_path: Path) -> None:
     """An isolated process keeps slow network calls off the UI thread."""
+    # 与 CLI 共用同一把 Monitor 锁：同一时间只允许一个守护操作网络设置。
+    if not guard.repairs.acquire_single_instance("Monitor"):
+        emit("log", text="已有另一个守护实例在运行，本次未启动。", level="ERROR")
+        emit("status", text="已有守护在运行 · 请先停止", tone="error")
+        return
     config = validate_settings(read_settings(config_path))
     log_path = guard.resolve_path(config["log_file"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,9 +155,10 @@ def _monitor_worker(config_path, config, logger):
     repair_stats = {"dns_repairs": 0, "proxy_cleanups": 0}
     last_heartbeat = time.monotonic()
     logger.info("守护已启动，检测间隔 %s 秒", config["interval"])
-    logger.info("自动修复：代理清理 %s，DNS 修复 %s，Wi-Fi 重连 %s，网卡重置 %s",
+    logger.info("自动修复：代理清理 %s，DNS 修复 %s，有线修复 %s，Wi-Fi 重连 %s，网卡重置 %s",
                 "开" if config["cleanup_proxy_on_disconnect"] else "关",
                 "开" if config["repair_dns_on_failure"] else "关",
+                "开" if config["wired_recovery"] else "关",
                 "开" if config["wifi_recovery"] else "关",
                 "开" if config["adapter_reset_on_failure"] else "关")
     while True:
@@ -180,6 +188,8 @@ def _monitor_worker(config_path, config, logger):
                     dns_check_hosts=config["dns_check_hosts"],
                     wifi_recovery=config["wifi_recovery"],
                     adapter_reset=config["adapter_reset_on_failure"],
+                    wired_recovery=config["wired_recovery"],
+                    wired_reset=config["wired_reset_on_failure"] and config["adapter_reset_on_failure"],
                     dns_reset_interfaces=config["dns_reset_interfaces"], repair_stats=repair_stats)
                 successes += int(online)
             interfaces = guard.get_wifi_interfaces(logger, config["interface"])
@@ -361,7 +371,8 @@ class GuardApp:
         for key, text in (
             ("cleanup_proxy_on_disconnect", "清理系统代理（代理工具失效导致的应用层断网）"),
             ("repair_dns_on_failure", "修复 DNS（清空缓存 + 网卡 DNS 回退自动获取）"),
-            ("wifi_recovery", "重连已保存的 Wi-Fi（有线环境可关闭）"),
+            ("wired_recovery", "先修复有线连接（DHCP 续约，解决拿不到 IP 地址）"),
+            ("wifi_recovery", "再重连已保存的 Wi-Fi（有线恢复不了才走这一步）"),
             ("adapter_reset_on_failure", "全部失败后禁用/启用网卡（需管理员权限）"),
             ("prevent_sleep", "守护期间阻止系统休眠"),
         ):
@@ -692,6 +703,13 @@ def main():
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     root = tk.Tk()
+    # 只允许打开一个界面窗口，避免两个窗口各起一个守护互相打架。
+    if not args.smoke_test and not guard.repairs.acquire_single_instance("Gui"):
+        root.withdraw()
+        from tkinter import messagebox
+        messagebox.showwarning("Network Guard", "程序已在运行，请勿重复打开。")
+        root.destroy()
+        return
     if args.smoke_test:
         # Offline packaged smoke test: construct every tab, without netsh/network.
         from unittest.mock import patch

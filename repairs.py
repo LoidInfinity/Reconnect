@@ -273,6 +273,194 @@ def repair_dns(logger, interface_names: Iterable[str]) -> bool:
     return repaired
 
 
+# ------------------------------------------------- wired / wireless link state
+
+VIRTUAL_ADAPTER_PATTERN = "VMware|Hyper-V|Virtual|Loopback|TAP|TUN|WSL|Bluetooth"
+
+
+def get_physical_adapters(logger) -> list[dict[str, str]]:
+    """Physical adapters with status, IPv4 address and default gateway.
+
+    Virtual adapters are excluded: they are always ``Up`` and would make an
+    outage look healthy. ``MediaType`` tells wired (802.3) from wireless
+    (Native 802.11) so recovery can prefer the cable.
+    """
+    script = (
+        "Get-NetAdapter | Where-Object { $_.Status -ne 'Not Present' -and "
+        f"$_.InterfaceDescription -notmatch '{VIRTUAL_ADAPTER_PATTERN}' }} | "
+        "ForEach-Object { "
+        "$ip = Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 "
+        "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "$gw = Get-NetRoute -InterfaceIndex $_.ifIndex -DestinationPrefix '0.0.0.0/0' "
+        "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "[pscustomobject]@{ "
+        "Name = $_.Name; Status = $_.Status; MediaType = $_.MediaType; "
+        "IP = $ip.IPAddress; Gateway = $gw.NextHop } "
+        "} | ConvertTo-Json -Compress -Depth 3"
+    )
+    try:
+        completed = _run(["powershell", "-NoProfile", "-Command", script], logger, 20)
+        raw = (completed.stdout or "").strip()
+        if not raw:
+            return []
+        parsed = json.loads(raw)
+        items = parsed if isinstance(parsed, list) else [parsed]
+        return [item for item in items if isinstance(item, dict)]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("获取物理网卡信息失败: %s", exc)
+        return []
+
+
+def is_apipa(address: str | None) -> bool:
+    """``169.254.x.x`` means DHCP never answered and Windows self-assigned."""
+    return bool(address) and str(address).startswith("169.254.")
+
+
+def is_wired(adapter: dict) -> bool:
+    """True for Ethernet adapters (802.3), False for Wi-Fi (Native 802.11)."""
+    media = str(adapter.get("MediaType") or "")
+    name = str(adapter.get("Name") or "").casefold()
+    if "802.11" in media:
+        return False
+    if media:
+        return "802.3" in media
+    # MediaType missing: fall back to the usual WLAN naming.
+    return not any(word in name for word in ("wlan", "wi-fi", "wifi", "无线"))
+
+
+def is_link_healthy(adapter: dict) -> bool:
+    """Up + a real IPv4 lease (not APIPA) + a default gateway."""
+    if str(adapter.get("Status") or "").casefold() != "up":
+        return False
+    address = adapter.get("IP")
+    return bool(address) and not is_apipa(address) and bool(adapter.get("Gateway"))
+
+
+def renew_dhcp(logger, interface_name: str) -> bool:
+    """Release/renew the lease so an APIPA address can be replaced.
+
+    This is the repair for "cable is plugged in but there is no IPv4
+    address": DNS resets cannot fix a missing lease.
+    """
+    if not interface_name:
+        return False
+    logger.warning("⚠ 对网卡 '%s' 执行 DHCP 续约…", interface_name)
+    _run(["ipconfig", "/release", interface_name], logger, 20)
+    time.sleep(1)
+    completed = _run(["ipconfig", "/renew", interface_name], logger, 40)
+    if completed.returncode == 0:
+        logger.info("✓ 网卡 '%s' DHCP 续约命令已完成", interface_name)
+        return True
+    logger.warning("网卡 '%s' DHCP 续约返回码: %s", interface_name, completed.returncode)
+    return False
+
+
+def _reset_named_adapter(logger, adapter_name: str) -> bool:
+    """Disable/enable one named adapter, verifying the state afterwards."""
+    script = (
+        '$ErrorActionPreference = "Stop"; '
+        "try { "
+        f"  $adapter = Get-NetAdapter -Name '{adapter_name}' -ErrorAction Stop; "
+        '  if ($adapter.Status -eq "Disabled") { '
+        "    Enable-NetAdapter -Name $adapter.Name -Confirm:$false; "
+        "  } else { "
+        "    Disable-NetAdapter -Name $adapter.Name -Confirm:$false; "
+        "    Start-Sleep -Seconds 3; "
+        "    Enable-NetAdapter -Name $adapter.Name -Confirm:$false; "
+        "  } "
+        "  Start-Sleep -Seconds 3; "
+        "  $now = Get-NetAdapter -Name $adapter.Name; "
+        '  if ($now.Status -eq "Up") { Write-Output "OK:$($adapter.Name)" } '
+        '  else { Write-Output "ENABLE_FAILED:STATUS=$($now.Status)" } '
+        "} catch { "
+        '  if ($_.Exception.Message -match "拒绝访问|Access is denied|Access Denied|PermissionDenied|Error 5") { '
+        "    Write-Output 'ACCESS_DENIED' "
+        "  } else { "
+        '    Write-Output ("ERROR:" + $_.Exception.Message) '
+        "  } "
+        "}"
+    )
+    try:
+        completed = _run(["powershell", "-NoProfile", "-Command", script], logger, 25)
+        lines = (completed.stdout or "").strip().splitlines()
+        last = lines[-1] if lines else ""
+        if last.startswith("OK:"):
+            logger.info("✓ 网卡 '%s' 已重置（状态确认为 Up）", last[3:])
+            time.sleep(3)
+            return True
+        if last == "ACCESS_DENIED":
+            logger.error("⛔ 网卡重置被拒绝：需要管理员权限。")
+        elif last.startswith("ENABLE_FAILED"):
+            logger.warning("网卡启用未达预期: %s", last)
+        elif last.startswith("ERROR:"):
+            logger.warning("网卡重置脚本错误: %s", last)
+        else:
+            logger.warning("网卡重置结果未知: %r", last)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("网卡 '%s' 重置失败: %s", adapter_name, exc)
+    return False
+
+
+def has_healthy_wired_link(logger) -> bool:
+    """True when a wired adapter already holds a usable lease.
+
+    Read-only probe: used to decide whether the wireless path may be skipped.
+    Reconnecting Wi-Fi while the cable is working can steal the default route
+    and briefly interrupt a perfectly good connection.
+    """
+    adapters = get_physical_adapters(logger)
+    return any(is_wired(item) and is_link_healthy(item) for item in adapters)
+
+
+def repair_wired_links(logger, allow_reset: bool = False,
+                       adapters: list[dict] | None = None) -> bool:
+    """Repair wired adapters: renew the lease first, reset the adapter last.
+
+    Returns ``True`` when a repair action was attempted and the adapter now
+    holds a usable lease, so the caller can re-test connectivity.
+    """
+    if adapters is None:
+        adapters = get_physical_adapters(logger)
+    wired = [item for item in adapters if is_wired(item)]
+    if not wired:
+        logger.debug("未检测到有线网卡，跳过有线修复。")
+        return False
+
+    unhealthy = [item for item in wired if not is_link_healthy(item)]
+    if not unhealthy:
+        logger.info("有线连接正常（已获得有效 IP 与网关）。")
+        return False
+
+    for adapter in unhealthy:
+        name = str(adapter.get("Name") or "")
+        if not name:
+            continue
+        logger.warning(
+            "有线网卡 '%s' 异常：状态=%s，IP=%s，网关=%s%s",
+            name,
+            adapter.get("Status") or "?",
+            adapter.get("IP") or "无",
+            adapter.get("Gateway") or "无",
+            "（DHCP 未响应，已回退 APIPA）" if is_apipa(adapter.get("IP")) else "",
+        )
+        renew_dhcp(logger, name)
+        refreshed = get_physical_adapters(logger)
+        mine = next((x for x in refreshed if x.get("Name") == name), None)
+        if mine and is_link_healthy(mine):
+            logger.info("✓ 有线网卡 '%s' 已恢复有效租约。", name)
+            return True
+        if allow_reset:
+            logger.warning("DHCP 续约未能恢复 '%s'，尝试重置该网卡…", name)
+            if _reset_named_adapter(logger, name):
+                renew_dhcp(logger, name)
+                refreshed = get_physical_adapters(logger)
+                mine = next((x for x in refreshed if x.get("Name") == name), None)
+                if mine and is_link_healthy(mine):
+                    logger.info("✓ 有线网卡 '%s' 重置后已恢复。", name)
+                    return True
+    return False
+
+
 # ------------------------------------------------------------ adapter reset
 
 
@@ -372,6 +560,64 @@ def reset_wifi_adapter(logger) -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Wi-Fi 网卡重置失败: %s", exc)
     return False
+
+
+# ------------------------------------------------------ single instance lock
+
+# Handles must outlive the call, otherwise the mutex is released immediately.
+_single_instance_handles: list = []
+# Names already owned by this process: a second call must stay True (the same
+# Windows mutex is not re-entrant across CreateMutexW calls).
+_single_instance_names: set[str] = set()
+
+_ERROR_ALREADY_EXISTS = 183
+
+
+def acquire_single_instance(name: str) -> bool:
+    """Take a per-session named lock; ``False`` if another process holds it.
+
+    A named mutex is stronger than a PID file: the kernel releases it when the
+    owning process dies, so a crash never leaves a stale lock that blocks the
+    next start. Scope is the logon session (``Local\\``), which is what we want
+    here — one guard per user session. Calling it twice with the same name in
+    one process is idempotent and returns ``True``.
+    """
+    if name in _single_instance_names:
+        return True
+    if sys.platform != "win32":  # pragma: no cover - this app is Windows-only
+        return True
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = kernel32.CreateMutexW(None, True, f"Local\\NetworkGuard.{name}")
+    if not handle:
+        return False
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    _single_instance_handles.append(handle)
+    _single_instance_names.add(name)
+    return True
+
+
+def release_single_instance() -> None:
+    """Release every lock this process holds. Safe to call twice."""
+    global _single_instance_handles
+    _single_instance_names.clear()
+    if sys.platform != "win32":  # pragma: no cover
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    while _single_instance_handles:
+        handle = _single_instance_handles.pop()
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ------------------------------------------------------- PID and crash state
