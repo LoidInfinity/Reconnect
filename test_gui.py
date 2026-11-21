@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import tkinter as tk
@@ -97,8 +98,10 @@ class WorkerTests(unittest.TestCase):
 
 class WindowTests(unittest.TestCase):
     def setUp(self):
-        # CI runners without an interactive desktop cannot create a Tk window;
-        # skip instead of failing the release build.
+        # 无交互桌面的环境（如 CI）无法真正完成窗口布局，
+        # 布局断言在这里没有意义，直接跳过而不是让构建失败。
+        if os.environ.get("SKIP_GUI_WINDOW_TESTS"):
+            self.skipTest("已通过 SKIP_GUI_WINDOW_TESTS 跳过界面布局测试")
         try:
             probe = tk.Tk()
         except tk.TclError as exc:

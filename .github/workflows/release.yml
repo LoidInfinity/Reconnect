@@ -47,7 +47,26 @@ jobs:
           }
 
       - name: Run tests
-        run: python -m unittest discover -p "test_*.py" -v
+        env:
+          # 无交互桌面的 runner 无法完成窗口布局，布局断言在 CI 上无意义
+          SKIP_GUI_WINDOW_TESTS: "1"
+        shell: pwsh
+        run: |
+          python -m unittest discover -p "test_*.py" -v 2>&1 | Tee-Object -FilePath tests.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $lines = Get-Content tests.log -ErrorAction SilentlyContinue
+            $selected = @($lines | Where-Object { $_ -match '^(FAIL|ERROR):|AssertionError|Error:|^FAILED' } | Select-Object -Last 8)
+            if ($selected.Count -eq 0) {
+              $selected = @($lines | Select-Object -Last 8)
+            }
+            foreach ($line in $selected) {
+              $safe = "$line" -replace '%', '%25' -replace "`r", ''
+              Write-Host "::error::$safe"
+            }
+            exit $code
+          }
+          Write-Host '全部测试通过'
 
       - name: Build distribution
         run: python build.py
