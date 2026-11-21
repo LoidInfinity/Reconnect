@@ -1,115 +1,117 @@
 # Network Guard 网络守护
 
-Windows Wi-Fi 自动恢复工具，提供中文桌面界面和命令行入口。
+Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重”自动修复有线和无线连接。
 
-当前版本：**0.1.0-alpha.2**（预发布版）。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **0.1.0-beta.1** · [更新记录](CHANGELOG.md) · [与初始脚本对照](LEGACY_REVIEW.md)
 
-初始脚本的完整功能对照及本次补齐项见 [LEGACY_REVIEW.md](LEGACY_REVIEW.md)。默认联网检测按用户提供的日志改为 `https://www.todesk.com`、`https://sunlogin.oray.com`、`https://www.awesun.com`，DNS 监测域名同步更新。旧默认配置会在读取时迁移，自定义检测地址保持原样。
+## 两种启动方式
 
-## Windows 打包版
+### 方式一：桌面界面（GUI）
 
-解压 `NetworkGuard-0.1.0-alpha.2-windows-x64.zip`，进入 `NetworkGuard` 文件夹双击 `NetworkGuard.exe`。无需安装 Python；请保留同目录的 `_internal` 文件夹。
+双击 `start_gui.bat`，或执行：
 
-打包版配置、日志及状态文件保存在 `%LOCALAPPDATA%\NetworkGuard`，源码运行仍保存在项目目录。现有源码配置不会自动复制；可自行复制配置并检查其中日志和状态路径，或在新界面重新设置。
+```powershell
+python gui.py
+```
 
-侧栏显示当前版本，点击“检查 GitHub 更新”会查询本仓库 GitHub Releases。Alpha 版本会检查包含预发布版在内的新版本，正式版只提示正式版更新。发现新版后可打开发布页手动下载；程序不自动下载或覆盖自身。暂无 Release、网络失败和请求限流会分别提示。版本按 SemVer 比较，支持 `v0.1.0-alpha.2` 等标签。
+可视化设置、实时日志、逐条控制哪些 Wi-Fi 参与恢复，适合日常使用。
 
-发布者需要创建对应 GitHub Release 并附上 ZIP，检查更新才能发现它；单独推送代码或标签不等于发布更新。
+### 方式二：终端（CLI，无窗口）
+
+双击 `start_cli.bat`，或执行：
+
+```powershell
+python main.py              # 前台运行，Ctrl+C 停止
+python main.py --verbose    # 控制台同时输出调试日志
+```
+
+适合服务器、开机脚本或不想开窗口的场景，日志同样写入 `network_guard.log`。
+
+两种方式共用同一把单实例锁，同一时间只能有一个守护在操作网络：重复启动 CLI 直接以返回码 2 退出，GUI 的“启动守护”会提示已有实例，重复双击 GUI 只保留一个窗口。
 
 ## 断线自动修复流程
 
-检测到断网后，按“从轻到重”的顺序修复，前一步解决就不再动后面的：
+**能上网就什么都不做。** 仅在 HTTP 检测失败时按顺序修复，前一步成功即停止：
 
-1. **DNS 修复**：探测配置的域名，解析失败时清空 DNS 缓存并把网卡 DNS 回退为 DHCP 自动获取。
-2. **系统代理清理**：FlClash / Clash / Mihomo 等本地代理退出后，Windows 仍把请求发往已失效的端口，导致 ping 通但应用断网。此步关闭系统代理开关（`ProxyEnable=0`、清空 PAC）并广播设置变更。
-3. **有线连接修复（优先）**：全部连接失效时先检查有线网卡。典型故障是“网线插着但 DHCP 没下发地址”，此时 IPv4 会回退为 `169.254.x.x`（APIPA）且没有默认网关——重置 DNS 治不好，必须执行 `ipconfig /release` + `/renew` 重新获取租约；仍无有效租约且允许时重置该有线网卡。虚拟网卡（VMware/Hyper-V/WSL 等）不参与判断，避免它们常驻 Up 掩盖真实故障。
-4. **Wi-Fi 重连**：仅在有线不可用时执行（无有线网卡，或修复后链路仍不健康）。**有线能正常工作就绝不碰无线**——重连 Wi-Fi 会抢占默认路由，可能主动打断一条本来正常的连接。按“上次成功 → 首选 → 其他已保存”的顺序尝试连接，受重连超时限制。
-5. **无线网卡重置**：不限制参与恢复的 Wi-Fi 配置时，全部失败后尝试禁用再启用网卡。存在参与名单或禁用名单时跳过此步，避免 Windows 自动连接被排除的 Wi-Fi。
+1. **DNS** — 域名解析失败则清空缓存，并把网卡 DNS 回退为 DHCP 自动获取。
+2. **系统代理** — Clash / FlClash 等代理退出后 Windows 仍发往失效端口（ping 通但应用断），此步关闭系统代理开关并清空 PAC。
+3. **有线（优先）** — 典型故障是“网线插着但 DHCP 没下发地址”：IPv4 回退成 `169.254.x.x` 且无默认网关，重置 DNS 治不好，必须 `ipconfig /release` + `/renew` 重新获取租约；仍无效且允许时重置该网卡。虚拟网卡不参与判断。
+4. **Wi-Fi** — 仅在有线不可用时重连（无有线网卡，或修复后链路仍不健康）。**有线正常绝不碰无线**——重连会抢占默认路由，可能主动打断一条本来正常的连接。按“上次成功 → 首选 → 其他已保存”尝试。
+5. **无线网卡重置** — 全部失败后禁用再启用网卡；存在参与名单时跳过，避免 Windows 自动连接被排除的 Wi-Fi。
 
-**原则：能上网就什么都不做。** 检测到 HTTP 可用时不会执行任何网络操作；有线链路已经健康（有有效 IP 与网关）时也不会重连无线，只在所有连接都失效时才从有线开始逐级尝试。
+补充说明：
 
-**Ping 成功不会阻止网络恢复**：HTTP 检测失败时先修复 DNS／代理，再修复有线，最后才尝试参与名单内的 Wi-Fi（需启用对应开关）。代理清理与网卡重置各有冷却时间（分别为 60 秒、300 秒）。第 5 步与有线网卡重置需要管理员权限，无权限时会记录失败原因。
-
-联网判定以 HTTP(S) 结果为准，ping 只用来区分“链路断了”和“链路正常但应用层坏了”。因为代理失效时 ping 依然通，用 ping 判定会漏报。
-
-当前三个检测目标中任意一个 HTTP 成功，就判定应用层可达。这不是远控会话健康检查：官网可访问但软件登录、会话或中继连接失败时，仍可能不触发恢复。此类故障需要接入对应软件提供的状态或实际服务健康探测，不能仅靠 ping 或官网判断。
+- 有线已有有效 IP 与网关时，直接跳过无线步骤。
+- **ping 通不算恢复**：代理失效时 ping 依然通，是否在线一律以 HTTP(S) 判定。
+- 代理清理与网卡重置分别有 60 秒、300 秒冷却；有线重置与第 5 步需管理员权限。
+- 三个检测地址（ToDesk / 向日葵 / AweSun 官网）任意一个可达即视为应用层可用。这不等于远控会话健康：官网能开但软件登录或中继失败时不会触发恢复。
 
 ## 运行诊断
 
-- **心跳日志**：默认每 60 秒输出一次，长时间无日志时才能区分“没事发生”和“程序卡死”。
-- **休眠检测**：等待时间远超预期时判定发生过系统休眠，立即重置网络状态重新检测；守护默认阻止系统休眠（显示器仍可关闭）。
-- **崩溃检测**：启动时若发现残留 PID 文件，说明上次异常退出，会回放崩溃前最后 15 行日志并记录退出原因。
-- **命令超时**：`netsh` 卡在驱动层时 `kill()` 不返回，因此命令等待由守护线程限时，超时即放弃等待，主循环不会被拖死。
-- **网卡识别回退**：`netsh wlan show interfaces` 依赖 WLAN AutoConfig 服务，网卡正在重置（MAC 显示 `00:00:00:00:00:00`、状态“正在断开连接”）或服务异常时会挂起或报错。此时程序改用 PowerShell（不依赖 wlansvc）识别网卡，日志会说明“已改用 PowerShell 识别到 N 个无线网卡”，避免误报“未识别到 Wi-Fi 网卡”。该回退能确认网卡存在与地址状态，但拿不到 SSID。
+- **心跳** — 默认 60 秒一次，用于区分“没事发生”和“程序卡死”。
+- **网卡识别回退** — `netsh wlan show interfaces` 在驱动重置时会挂起（MAC 显示 `00:00:00:00:00:00`、状态“正在断开连接”）。程序超时 10 秒后改用 PowerShell 识别网卡，日志会写明“已改用 PowerShell 识别到 N 个无线网卡”。
+- **命令超时** — 子进程卡死时由守护线程限时放弃等待，主循环不会被拖死。
+- **休眠 / 崩溃检测** — 休眠后立即重置状态重新检测；启动时若发现残留 PID 文件，会回放上次崩溃前 15 行日志。
 
 ## 构建与测试
 
-在 Windows x64、Python 3.10+（本版使用 Python 3.14）环境运行：
+需要 Windows x64 与 Python 3.10+：
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m unittest -v test_gui test_updates test_repairs test_legacy_compat test_recovery_policy test_wired_recovery
-python build.py
+python -m unittest discover -p "test_*.py"   # 62 个用例
+python build.py                              # 生成 dist/ 目录 + ZIP + SHA-256
 ```
 
-`dist` 中生成完整程序目录、版本 ZIP 和 SHA-256 校验文件。构建使用 PyInstaller 无控制台模式，后台守护通过临时事件文件回传日志。构建产物不提交到源码仓库。
+打包版无需安装 Python，解压后双击 `NetworkGuard.exe`，请保留同目录的 `_internal` 文件夹。发布者需在 GitHub 创建对应的 Release 并附上 ZIP，内置的“检查 GitHub 更新”才能发现新版本（仅推送代码或标签不算发布）。
 
-## 启动桌面界面
+## 界面说明
 
-双击 `start_gui.bat`，或运行：
+- **启动 / 停止守护** — 停止或关闭窗口会结束该窗口启动的守护进程。
+- **已保存的 Wi-Fi** — 刷新配置与网卡状态，将所选配置设为首选；不读取也不展示 Wi-Fi 密码。
+- **参与恢复开关** — 只有勾选的配置参与重连；新发现的配置默认不参与，全部关闭时不会发起连接。选择保存于 `enabled_profiles`。
+- **守护设置** — 检测间隔、重连超时、网卡、首选配置、检测地址、五类修复开关、防休眠。运行中修改需重启守护才生效。
+- **运行日志** — 实时输出；“清空显示”只清界面，不删磁盘日志。
 
-```powershell
-.\.conda\python.exe gui.py
-```
+打开界面只读取 Wi-Fi 信息，点“启动守护”后才开始检测与修复。可用 `python gui.py --config 路径` 指定配置文件。
 
-没有项目虚拟环境时，可使用安装了 Tkinter 的 Python 3.10+：`python gui.py`。无需第三方 GUI 依赖。
+## 命令行参数
 
-- **启动守护 / 停止守护**：启动后定期检测网络，断线时自动尝试修复。停止或关闭窗口会结束该窗口启动的守护进程。
-- **已保存的 Wi-Fi**：刷新配置及网卡状态，将所选配置设为首选。程序不会读取或展示 Wi-Fi 密码。
-- **参与恢复开关**：首次读取 Wi-Fi 列表时，仅当前已连接的配置默认参与恢复，其他配置默认不参与；未连接或无法识别当前配置时全部不参与。点击每条 Wi-Fi 右侧的“☑ 使用 / ☐ 不使用”（也可选中后按空格）自动保存选择。刷新、重启会保留已保存的选择，新发现的配置默认不参与。关闭的配置即使是首选或上次成功连接，也会跳过；全部关闭时不会发起 Wi-Fi 连接。GUI 守护从下一轮恢复读取开关，当前已开始的恢复轮次不受影响；命令行在下次启动时读取配置。升级旧版配置时按当前连接初始化，保留原有明确禁用项；允许参与的配置保存于 `enabled_profiles`。
-- **守护设置**：编辑检测间隔、重连超时、网卡、首选配置和检测地址，并开关五类自动修复（清理系统代理、修复 DNS、修复有线连接、重连 Wi-Fi、失败后重置网卡）与“守护期间阻止系统休眠”。首次启动守护时自动保存配置；运行中修改设置需停止并重新启动守护。
-- **运行日志**：查看实时输出；“清空显示”仅清空界面，不删除磁盘日志。
+参数会覆盖配置文件中的同名项：
 
-打开界面只读取 Wi-Fi 信息，点击“启动守护”后才会检测和自动修复。网络可用性包含有线网络；网卡信息单独显示 Wi-Fi 状态。
+| 参数 | 作用 |
+| --- | --- |
+| `--config 路径` | 指定配置文件 |
+| `--interval 秒` / `--reconnect-timeout 秒` | 检测间隔 / 单次重连超时 |
+| `--check-target 地址` | 自定义 HTTP 检测地址（可重复） |
+| `--preferred-profile 名称` / `--interface 网卡` | 首选 Wi-Fi / 指定网卡 |
+| `--no-wifi-recovery` | 不重连 Wi-Fi（纯有线环境） |
+| `--no-wired-recovery` | 不检查有线（纯无线环境） |
+| `--no-cleanup-proxy` / `--no-repair-dns` / `--no-reset-adapter` | 关闭对应修复步骤 |
+| `--no-prevent-sleep` | 不阻止系统休眠 |
+| `--heartbeat-interval 秒` | 心跳日志间隔 |
+| `--verbose` | 控制台输出调试日志 |
+| `--save-default-config` | 生成默认配置后退出 |
 
-默认配置、轮换日志、PID 和连接状态写入项目目录（已被 `.gitignore` 排除）；相对路径以程序目录为基准，因此开机自启时不会写错位置。可用 `python gui.py --config 路径` 指定配置文件。已有配置中的日志路径等高级字段会保留。
+默认先修有线再修无线；没有有线网卡时自动跳过。完整参数见 `python main.py --help`。
 
-## 命令行
+## 开机自启
 
-无需图形界面时用终端模式：双击 `start_cli.bat`，或运行：
+右键以管理员身份运行 `install_admin_task.bat`：创建最高权限的登录计划任务 `NetworkGuard`，以无窗口方式运行 `gui.py --worker`，并清理旧的 `start_network_guard.bat`。
 
-```powershell
-python main.py                       # 前台运行，Ctrl+C 停止
-python main.py --verbose             # 同时在控制台输出调试日志
-python main.py --no-wifi-recovery     # 只用代理/DNS/有线修复，不重连 Wi-Fi
-python main.py --no-wired-recovery    # 不检查有线（仅无线环境）
-```
+重置网卡、修改网卡 DNS 需要管理员权限；系统代理开关通常不需要。无权限时会记录失败原因。
 
-无图形界面、适合服务器或开机脚本：日志同时写入 `network_guard.log`。完整参数：
+## 文件位置
 
-```powershell
-python main.py --save-default-config
-python main.py
-python main.py --no-cleanup-proxy --no-repair-dns   # 关闭对应修复步骤
-python main.py --no-reset-adapter --no-prevent-sleep --heartbeat-interval 120
-```
-
-命令行参数会覆盖配置文件中的同名项：`--interval`、`--reconnect-timeout`、`--check-target`、`--preferred-profile`、`--interface`、`--log-file`、`--log-max-bytes`、`--log-backup-count`、`--state-file`、`--pid-file`、`--heartbeat-interval`、`--no-prevent-sleep`、`--no-cleanup-proxy`、`--no-repair-dns`、`--no-reset-adapter`、`--no-wired-recovery`、`--no-wifi-recovery`、`--verbose`。
-
-有线与无线环境均可使用：默认先修有线再修无线；没有有线网卡时自动跳过有线步骤，完全插网线但关闭 Wi-Fi 的机器可加 `--no-wifi-recovery`，只用 Wi-Fi 的机器可加 `--no-wired-recovery`。
-
-GUI 与命令行共用同一把单实例锁：同一时间只允许一个守护在操作网络。已有实例在运行时，新启动的 CLI 会直接退出（返回码 2），GUI 的“启动守护”会提示已有实例；重复双击 GUI 也只会保留一个窗口。这一保护使用 Windows 命名互斥量（`Local\NetworkGuard.Monitor` / `Local\NetworkGuard.Gui`），进程崩溃时由内核自动释放，不会像 PID 文件那样残留导致下次无法启动。
-
-## 管理员自启
-
-右键以管理员身份运行 `install_admin_task.bat`，会创建最高权限的登录计划任务 `NetworkGuard`，直接启动 `gui.py --worker`（无窗口后台守护），并清理旧的 `start_network_guard.bat`。修改网卡 DNS 和重置网卡可能需要管理员权限；当前用户的系统代理开关通常不需要。无相应权限时会记录修复失败原因。
+| 运行方式 | 配置 / 日志 / 状态 / PID |
+| --- | --- |
+| 源码运行 | 项目目录（相对路径以程序目录为基准，开机自启不会写错位置） |
+| 打包运行 | `%LOCALAPPDATA%\NetworkGuard` |
 
 ## 隐私说明
 
-- 磁盘日志会把 SSID、AP BSSID、网卡物理地址与 GUID 替换为 `<redacted>` / `<mac>` / `<guid>`，界面仍正常显示这些信息。
-- 默认检测地址与 DNS 监测域名均为公共站点，不含个人或单位内部域名。
-- 配置、日志、状态、PID 文件默认被 `.gitignore` 排除，不随仓库分发。需要版本化配置时提交不含真实信息的 `network_guard_config.example.json` 模板；真实配置文件里的 Wi-Fi 名称、内网地址不应入库。
+- 日志中的 SSID、AP BSSID、网卡物理地址与 GUID 会被替换为 `<redacted>` / `<mac>` / `<guid>`，界面仍正常显示。
+- 检测地址与 DNS 监测域名均为公共站点，不含个人或单位内部域名。
+- 配置、日志、状态、PID 均被 `.gitignore` 排除。需要版本化配置时请提交不含真实信息的 `network_guard_config.example.json`；真实配置中的 Wi-Fi 名称与内网地址不应入库。
 
-如果没有读到 Wi-Fi 信息，请检查无线网卡、WLAN AutoConfig 服务，以及 Windows 对 Wi-Fi 信息的访问权限。
-
-界面行高和侧栏宽度随字体尺寸调整；小窗口或高 DPI 下可通过右侧滚动条查看完整内容，较长的 Wi-Fi 名称可用列表底部横向滚动条查看。
+如未读到 Wi-Fi 信息，请检查无线网卡、WLAN AutoConfig 服务，以及 Windows 对 Wi-Fi 信息的访问权限。
