@@ -28,6 +28,16 @@ BASE = APP_DIR
 BG = "#f3f6fb"
 INK = "#172b4d"
 MUTED = "#64748b"
+
+
+def wrap_label(label, parent, margin: int = 0) -> None:
+    """Keep a label's text wrapped to its container width."""
+    parent.bind(
+        "<Configure>",
+        lambda event: label.configure(wraplength=max(80, event.width - margin)),
+        add="+",
+    )
+    label.configure(justify="left", wraplength=400)
 BLUE = "#2563eb"
 
 
@@ -258,7 +268,9 @@ class GuardApp:
         tk.Label(sidebar, text="Windows Wi-Fi\n自动检测 · 断线恢复", justify="left", bg="#11233f",
                  fg="#9eb2d0", font=("Microsoft YaHei UI", 10), pady=25).pack(side="bottom", padx=20, anchor="w")
         self.update_button = ttk.Button(sidebar, text="检查 GitHub 更新", command=self.check_for_updates)
-        self.update_button.pack(side="bottom", padx=20, pady=8, anchor="w")
+        self.update_button.pack(side="bottom", padx=20, pady=(0, 2), anchor="w")
+        self.support_button = ttk.Button(sidebar, text="遇到问题", command=self.open_support)
+        self.support_button.pack(side="bottom", padx=20, pady=(2, 8), anchor="w")
         tk.Label(sidebar, text=f"v{VERSION}", bg="#11233f", fg="#9eb2d0",
                  font=("Microsoft YaHei UI", 10)).pack(side="bottom", padx=20, anchor="w")
         # A scrollable content area preserves full widget heights at high DPI
@@ -285,9 +297,6 @@ class GuardApp:
             if not isinstance(event.widget, (tk.Text, ttk.Treeview)):
                 self.content_canvas.yview_scroll(-int(event.delta / 120), "units")
         self.root.bind("<MouseWheel>", scroll_content, add="+")
-        def wrap_label(label, parent, margin=0):
-            parent.bind("<Configure>", lambda e: label.configure(wraplength=max(80, e.width - margin)), add="+")
-            label.configure(justify="left", wraplength=400)
         headline = ttk.Label(body, text="让连接持续在线", font=("Microsoft YaHei UI", 23, "bold"))
         headline.pack(anchor="w")
         wrap_label(headline, body, 40)
@@ -382,16 +391,8 @@ class GuardApp:
         ttk.Button(settings, text="保存设置", command=self.save).grid(row=7, column=1, sticky="e", pady=8)
         toolbar = ttk.Frame(logs)
         toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Label(toolbar, text="实时输出", foreground=MUTED).pack(side="left")
-        ttk.Button(toolbar, text="清空", command=self.clear_logs).pack(side="right")
-        ttk.Button(toolbar, text="打包日志", command=self.export_logs).pack(side="right", padx=(0, 6))
-        self.support_hint = ttk.Label(
-            logs,
-            text=f"遇到问题？点“打包日志”，把生成的压缩包发送到 {guard.repairs.SUPPORT_EMAIL} 并描述具体情况。",
-            foreground=MUTED,
-        )
-        self.support_hint.pack(anchor="w", pady=(0, 6))
-        wrap_label(self.support_hint, logs, 40)
+        ttk.Label(toolbar, text="实时输出 · 最多显示 1500 行", foreground=MUTED).pack(side="left")
+        ttk.Button(toolbar, text="清空显示", command=self.clear_logs).pack(side="right")
         self.log_text = tk.Text(logs, bg="#102139", fg="#d6e2f3", font=("Consolas", 10),
                                 width=24, height=10, wrap="word", relief="flat", state="disabled")
         scroll = ttk.Scrollbar(logs, command=self.log_text.yview)
@@ -616,28 +617,9 @@ class GuardApp:
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
 
-    def export_logs(self):
-        """Bundle recent logs into a ZIP the user can email to support."""
-        try:
-            config = read_settings(self.config_path)
-            log_path = guard.resolve_path(config["log_file"])
-            archive = guard.repairs.export_logs(log_path, VERSION)
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("打包失败", str(exc), parent=self.root)
-            return
-        if archive is None:
-            messagebox.showinfo(
-                "打包日志",
-                "还没有生成日志文件。请先启动守护运行一段时间再打包。",
-                parent=self.root,
-            )
-            return
-        messagebox.showinfo(
-            "打包完成",
-            f"已生成：\n{archive}\n\n"
-            f"遇到问题请把该压缩包发送到 {guard.repairs.SUPPORT_EMAIL}，并描述具体情况。",
-            parent=self.root,
-        )
+    def open_support(self):
+        """Open the problem-report dialog: bundle logs or open the log folder."""
+        SupportDialog(self.root, self.config_path)
 
     def poll(self):
         for _ in range(200):
@@ -708,6 +690,93 @@ class GuardApp:
                     self.root.destroy()
                     return
         self.root.after(100, self.poll)
+
+
+class SupportDialog(tk.Toplevel):
+    """问题反馈窗口：预览压缩包名、打包日志、打开日志目录。"""
+
+    def __init__(self, parent, config_path: Path):
+        super().__init__(parent)
+        self.title("遇到问题 · 日志反馈")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+        try:
+            config = read_settings(config_path)
+            self.log_path = guard.resolve_path(config["log_file"])
+        except Exception:  # noqa: BLE001
+            self.log_path = guard.resolve_path("network_guard.log")
+        self.proposed: Path | None = None
+        self._build()
+        self.refresh_proposal()
+        self.update_idletasks()
+        self._center(parent)
+        self.grab_set()
+
+    def _center(self, parent) -> None:
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _build(self) -> None:
+        box = ttk.Frame(self, padding=20)
+        box.pack(fill="both", expand=True)
+        ttk.Label(box, text="遇到问题？可以把日志打包发来排查。",
+                  font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        self.state_label = ttk.Label(box, text="", foreground=MUTED, justify="left")
+        self.state_label.pack(anchor="w", pady=(12, 0))
+        self.mail_label = ttk.Label(box, text="", foreground=MUTED, justify="left")
+        self.mail_label.pack(anchor="w", pady=(6, 0))
+        buttons = ttk.Frame(box)
+        buttons.pack(fill="x", pady=(18, 0))
+        ttk.Button(buttons, text="打包日志", command=self.do_export).pack(side="left")
+        ttk.Button(buttons, text="打开日志文件夹", command=self.open_folder).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="关闭", command=self.destroy).pack(side="right")
+        wrap_label(self.state_label, box, 36)
+        wrap_label(self.mail_label, box, 36)
+
+    def refresh_proposal(self) -> None:
+        """Recompute the archive name so the text can name the real file."""
+        self.proposed = guard.repairs.proposed_archive_path(self.log_path)
+        name = self.proposed.name
+        self.state_label.configure(text=f"打包日志将日志打包为 {name}")
+        self.mail_label.configure(
+            text=f"请将生成的 {name} 发送到 {guard.repairs.SUPPORT_EMAIL}，并描述具体情况。"
+        )
+
+    def do_export(self) -> None:
+        try:
+            archive = guard.repairs.export_logs(
+                self.log_path, VERSION, archive_path=self.proposed
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("打包失败", str(exc), parent=self)
+            return
+        if archive is None:
+            messagebox.showinfo(
+                "打包日志",
+                "还没有生成日志文件。请先启动守护运行一段时间再打包。",
+                parent=self,
+            )
+            return
+        name = archive.name
+        self.state_label.configure(text=f"已打包为 {name}")
+        self.mail_label.configure(
+            text=f"请将生成的 {name} 发送到 {guard.repairs.SUPPORT_EMAIL}，并描述具体情况。"
+        )
+        # 下一次点击重新计算名字，避免覆盖刚生成的包。
+        self.proposed = None
+
+    def open_folder(self) -> None:
+        folder = self.log_path.parent
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if self.log_path.exists():
+                subprocess.run(["explorer", f"/select,{self.log_path}"], check=False)
+            else:
+                subprocess.run(["explorer", str(folder)], check=False)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("打开失败", str(exc), parent=self)
 
 
 def main():

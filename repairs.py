@@ -776,8 +776,26 @@ def collect_log_files(log_file: Path, max_files: int = 20) -> list[Path]:
     return found[:max_files]
 
 
+def proposed_archive_path(log_file: Path, destination: Path | None = None) -> Path:
+    """Path the next export would use (timestamp, plus a sequence if taken).
+
+    Lets the UI show the exact archive name before the user clicks export, so
+    the instruction can name the file instead of saying "the generated zip".
+    """
+    from datetime import datetime
+
+    target_dir = destination or log_file.parent
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive = target_dir / f"NetworkGuard-logs-{stamp}.zip"
+    sequence = 2
+    while archive.exists():
+        archive = target_dir / f"NetworkGuard-logs-{stamp}-{sequence}.zip"
+        sequence += 1
+    return archive
+
+
 def export_logs(log_file: Path, version: str = "", destination: Path | None = None,
-                max_files: int = 20) -> Path | None:
+                max_files: int = 20, archive_path: Path | None = None) -> Path | None:
     """Bundle recent logs plus a diagnostics sheet into one ZIP.
 
     Log lines are already redacted when written (SSID / BSSID / MAC / GUID
@@ -797,13 +815,11 @@ def export_logs(log_file: Path, version: str = "", destination: Path | None = No
 
     target_dir = destination or log_file.parent
     target_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    archive = target_dir / f"NetworkGuard-logs-{stamp}.zip"
-    # 同一秒内连续打包时追加序号，避免静默覆盖上一次的结果。
-    sequence = 2
-    while archive.exists():
-        archive = target_dir / f"NetworkGuard-logs-{stamp}-{sequence}.zip"
-        sequence += 1
+    # 用调用方预定的路径（UI 已把文件名展示给用户），但绝不静默覆盖已有文件。
+    archive = archive_path
+    if archive is None or archive.exists():
+        archive = proposed_archive_path(log_file, destination)
+    archive.parent.mkdir(parents=True, exist_ok=True)
 
     total_kb = sum(item.stat().st_size for item in files) / 1024
     note = [

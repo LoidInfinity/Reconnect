@@ -102,6 +102,39 @@ class ExportLogsTests(unittest.TestCase):
 
             self.assertNotEqual(first.name, second.name)
 
+    def test_proposed_name_matches_the_created_archive(self):
+        """界面预先展示的文件名必须与实际生成的一致。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = _touch(Path(tmp) / "network_guard.log", "line\n")
+
+            proposed = repairs.proposed_archive_path(log)
+            archive = repairs.export_logs(log, "test", archive_path=proposed)
+
+            self.assertEqual(archive, proposed)
+            self.assertTrue(archive.exists())
+
+    def test_proposed_path_skips_names_already_taken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            log = _touch(directory / "network_guard.log", "line\n")
+            first = repairs.export_logs(log, "test")
+
+            proposed = repairs.proposed_archive_path(log)
+
+            self.assertNotEqual(proposed, first)
+            self.assertFalse(proposed.exists())
+
+    def test_stale_archive_path_falls_back_to_a_free_name(self):
+        """若预定的名字在此期间被占用，不能静默覆盖。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = _touch(Path(tmp) / "network_guard.log", "line\n")
+            taken = repairs.export_logs(log, "test")
+
+            archive = repairs.export_logs(log, "test", archive_path=taken)
+
+            self.assertNotEqual(archive, taken)
+            self.assertTrue(taken.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
