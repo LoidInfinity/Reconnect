@@ -31,19 +31,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-build.txt
+        run: python -m pip install --no-input --disable-pip-version-check -r requirements-build.txt
 
       - name: Verify tag matches app_info.VERSION
         shell: pwsh
         run: |
-          $source = Get-Content -Raw -Encoding UTF8 app_info.py
-          if ($source -notmatch 'VERSION\s*=\s*"([^"]+)"') {
-            throw "无法从 app_info.py 解析 VERSION"
-          }
-          $version = $Matches[1]
-          $tag = $env:RELEASE_TAG -replace '^v', ''
+          $version = & python -c "import app_info; print(app_info.VERSION)"
+          if ($LASTEXITCODE -ne 0) { throw "无法导入 app_info，请检查是否有语法错误" }
+          $version = "$version".Trim()
+          $tag = "$env:RELEASE_TAG".Trim() -replace '^v', ''
           Write-Output "app_info.VERSION = $version"
           Write-Output "release tag      = $tag"
           if ($version -ne $tag) {
