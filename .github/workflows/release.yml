@@ -57,7 +57,7 @@ jobs:
           SKIP_GUI_WINDOW_TESTS: "1"
         shell: pwsh
         run: |
-          python -m unittest discover -p "test_*.py" -v 2>&1 | Tee-Object -FilePath tests.log
+          python -m unittest discover -s tests -t . -p "test_*.py" -v 2>&1 | Tee-Object -FilePath tests.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $lines = Get-Content tests.log -ErrorAction SilentlyContinue

@@ -17,7 +17,8 @@ import gui
 import main
 import repairs
 
-APP_DIR = Path(__file__).resolve().parent
+# tests/ 上一级才是仓库根目录（main.py / gui.py 所在位置）
+APP_DIR = Path(__file__).resolve().parent.parent
 
 
 class SingleInstanceTests(unittest.TestCase):

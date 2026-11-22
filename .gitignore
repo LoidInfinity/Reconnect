@@ -20,7 +20,7 @@ NetworkGuard-logs-*.zip
 # 打包版运行数据目录（%LOCALAPPDATA%\NetworkGuard）
 NetworkGuard/
 
-# 旧版本归档（含旧日志/环境，仅本地保留）
+# 旧版本归档（含旧日志/环境，仅本地保留；注意与 tests/ 测试目录区分）
 /test/
 
 # 本地 Python 环境
@@ -40,9 +40,9 @@ htmlcov/
 .env.*
 !.env.example
 
-# 编辑器/系统
-.vscode/*
-!.vscode/settings.json
+# 编辑器/系统（个人环境配置，其它开发者不需要）
+.vscode/
+*.code-workspace
 Thumbs.db
 desktop.ini
 
@@ -50,3 +50,4 @@ desktop.ini
 /build/
 /dist/
 *.spec
+tests.log

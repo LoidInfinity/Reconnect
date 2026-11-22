@@ -51,7 +51,25 @@ python main.py --verbose    # 控制台同时输出调试日志
 - **心跳** — 默认 60 秒一次，用于区分“没事发生”和“程序卡死”。
 - **网卡识别回退** — `netsh wlan show interfaces` 在驱动重置时会挂起（MAC 显示 `00:00:00:00:00:00`、状态“正在断开连接”）。程序超时 10 秒后改用 PowerShell 识别网卡，日志会写明“已改用 PowerShell 识别到 N 个无线网卡”。
 - **命令超时** — 子进程卡死时由守护线程限时放弃等待，主循环不会被拖死。
-- **休眠 / 崩溃检测** — 休眠后立即重置状态重新检测；启动时若发现残留 PID 文件，会回放上次崩溃前 15 行日志。
+- **休眠 / 崩溃检测** — 休眠后立即重置状态重新检测；启动时若发现残留 PID 文件，会回放上次会话最后 15 行日志（带 `[上次]` 标记，不会混入本次启动的日志）。
+
+## 仓库结构
+
+```
+gui.py / main.py                     GUI 与 CLI 两个入口
+repairs.py                           网络修复动作（DNS、代理、有线、Wi-Fi、网卡重置）
+updates.py                           检查 GitHub Release 更新
+app_info.py                          版本号与可写数据目录
+build.py                             PyInstaller 打包脚本
+tests/                               单元测试与版本一致性校验
+start_gui.bat / start_cli.bat        双击启动
+install_admin_task.bat / enable_wlan.bat   开机自启 / 手动启用无线网卡
+network_guard_config.example.json    配置模板（不含真实信息）
+CHANGELOG.md / LEGACY_REVIEW.md      更新记录 / 与初始脚本的对照
+LICENSE
+```
+
+不会入库的内容：真实配置 `network_guard_config.json`、日志与 PID、`dist/`、`build/`、`.vscode/`、`*.code-workspace`。
 
 ## 构建与测试
 
@@ -59,8 +77,8 @@ python main.py --verbose    # 控制台同时输出调试日志
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m unittest discover -p "test_*.py"   # 全部用例
-python build.py                              # 生成 dist/ 目录 + ZIP + SHA-256
+python -m unittest discover -s tests -t . -p "test_*.py"   # 全部用例
+python build.py                                            # 生成 dist/ 目录 + ZIP + SHA-256
 ```
 
 打包版无需安装 Python，解压后双击 `NetworkGuard.exe`，请保留同目录的 `_internal` 文件夹。

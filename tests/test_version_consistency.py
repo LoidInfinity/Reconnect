@@ -10,7 +10,7 @@ import unittest
 import app_info
 import updates
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def _read(name: str) -> str:
