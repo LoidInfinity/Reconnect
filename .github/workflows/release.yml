@@ -99,6 +99,8 @@ jobs:
           body: |
             Windows x64 构建（预发行）。解压 `NetworkGuard-*-windows-x64.zip` 后运行 `NetworkGuard.exe`（图形界面）或 `start_cli.bat`（命令行模式）。
 
+            > 首次双击 `.bat` 若提示「无法验证发布者，此文件没有包含有效的数字签名」，这是 Windows 对网上下载文件的安全标记（`.bat` 无法代码签名）。请先右键 ZIP →「属性」→ 勾选「解除锁定」再解压，或解压后执行 `Get-ChildItem -Path <解压目录> -Recurse | Unblock-File`。详见包内 `READ-ME-FIRST.txt`。
+
             校验下载文件：`Get-FileHash <zip 文件> -Algorithm SHA256`，与 `.sha256` 文件中的摘要比对。
 
             遇到问题请通过程序内「遇到问题」按钮打包日志，发送到 1164275580@qq.com。

@@ -51,6 +51,30 @@ def main():
         shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
     if (ROOT / "CHANGELOG.md").exists():
         shutil.copy2(ROOT / "CHANGELOG.md", output / "CHANGELOG.md")
+    # 从网上下载的 ZIP 解压后，Windows 会给每个文件打上"来自 Internet"标记，
+    # 双击 .bat 时提示"无法验证发布者"。.bat 无法代码签名，只能靠解除锁定。
+    (output / "READ-ME-FIRST.txt").write_text(
+        "如果双击 start_gui.bat 时 Windows 提示\n"
+        "  \"无法验证发布者，此文件没有包含有效的数字签名以验证其发布者\"\n"
+        "这是 Windows 对「从网上下载的文件」的安全提示，不是程序故障，也不是文件损坏。\n"
+        "（.bat 文件无法进行代码签名，所以这个提示只能靠解除锁定来消除。）\n"
+        "\n"
+        "一次性解决办法，任选其一：\n"
+        "\n"
+        "A. 解压前解除（推荐）\n"
+        "   右键下载的 ZIP 文件 -> 属性 -> 在「常规」页最下方勾选「解除锁定」-> 确定，然后再解压。\n"
+        "   这样解压出来的文件都不再带标记，之后双击不会再提示。\n"
+        "\n"
+        "B. 已经解压了（PowerShell 一行命令）\n"
+        "   把路径换成你自己的解压目录：\n"
+        "   Get-ChildItem -Path \"D:\\NetworkGuard\" -Recurse | Unblock-File\n"
+        "\n"
+        "C. 图形界面\n"
+        "   全选本文件夹里的所有文件 -> 右键 -> 属性 -> 勾选「解除锁定」-> 确定\n"
+        "\n"
+        "解除后双击 start_gui.bat 即可正常启动。\n",
+        encoding="utf-8-sig",
+    )
     archive = Path(shutil.make_archive(str(ROOT / "dist" / f"NetworkGuard-{VERSION}-windows-x64"),
                                       "zip", ROOT / "dist", "NetworkGuard"))
     with archive.open("rb") as stream:
