@@ -1,5 +1,25 @@
 # 更新记录
 
+## 0.1.0-rc.1 — 2026-11-22
+
+首个发布候选版（Release Candidate）。功能与 beta.3 一致，主要变化是仓库结构与运行时目录。
+
+**仓库结构**
+
+- 源码集中到 `src/`，测试到 `tests/`，配置模板到 `config/`，对照文档到 `docs/`；根目录只保留 README、LICENSE、更新记录、`requirements-build.txt` 与四个启动脚本。
+- `tests/__init__.py` 负责把 `src` 加入 `sys.path`，测试命令统一为 `python -m unittest discover -s tests -t . -p "test_*.py"`。
+
+**运行时目录**
+
+- 配置、状态、PID 收进 `data/`，日志单独放在 `data/logs/`（打包版对应 `%LOCALAPPDATA%\NetworkGuard` 及其 `logs` 子目录）。
+- 首次启动自动迁移旧版本散落在根目录的文件，并把配置中的旧 `log_file` 升级为 `logs/network_guard.log`，现有设置不会丢失。
+- `.gitignore` 追加 `/data/`、`/logs/`、`.vscode/`、`*.code-workspace`，个人 IDE 配置与自动生成的空工作区文件不再入库。
+
+**构建与发布**
+
+- `build.py` 移入 `src/`，命令变为 `python src/build.py`，GitHub Actions 工作流同步更新。
+- 版本一致性测试与自动发布继续生效；标签中含 `-beta` / `-alpha` / `-rc` 时 Release 判定为预发行。
+
 ## 0.1.0-beta.3 — 2026-11-22
 
 **崩溃日志回放更准确**
