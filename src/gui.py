@@ -45,7 +45,7 @@ def read_settings(path: Path) -> dict:
     defaults = dict(interval=10, reconnect_timeout=35,
                     check_targets=list(guard.DEFAULT_CHECK_TARGETS),
                     preferred_profiles=[], disabled_profiles=[], enabled_profiles=None, interface=None, verbose=False,
-                    log_file=guard.DEFAULT_LOG_FILE.name,
+                    log_file=guard.LOG_SUBPATH,
                     state_file=guard.DEFAULT_STATE_FILE.name,
                     log_max_bytes=2097152, log_backup_count=5,
                     heartbeat_interval=60, pid_file=guard.DEFAULT_PID_FILE.name,
@@ -137,6 +137,7 @@ def worker(config_path: Path) -> None:
         emit("log", text="已有另一个守护实例在运行，本次未启动。", level="ERROR")
         emit("status", text="已有守护在运行 · 请先停止", tone="error")
         return
+    guard.migrate_legacy_layout()
     config = validate_settings(read_settings(config_path))
     log_path = guard.resolve_path(config["log_file"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -708,7 +709,7 @@ class SupportDialog(tk.Toplevel):
             config = read_settings(config_path)
             self.log_path = guard.resolve_path(config["log_file"])
         except Exception:  # noqa: BLE001
-            self.log_path = guard.resolve_path("network_guard.log")
+            self.log_path = guard.resolve_path(guard.LOG_SUBPATH)
         self.proposed: Path | None = None
         self._build()
         self.refresh_proposal()
@@ -783,6 +784,7 @@ class SupportDialog(tk.Toplevel):
 
 
 def main():
+    guard.migrate_legacy_layout()
     parser = argparse.ArgumentParser(description="Network Guard 图形界面")
     parser.add_argument("--config", type=Path, default=guard.DEFAULT_CONFIG_FILE)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)

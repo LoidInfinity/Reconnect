@@ -8,7 +8,8 @@ import sys
 
 from app_info import VERSION
 
-ROOT = Path(__file__).resolve().parent
+SOURCE_DIR = Path(__file__).resolve().parent
+ROOT = SOURCE_DIR.parent
 
 
 def main():
@@ -38,12 +39,14 @@ def main():
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--onedir", "--windowed", "--name", "NetworkGuard",
         "--version-file", str(version_file), "--distpath", str(ROOT / "dist"),
-        "--workpath", str(build / "pyinstaller"), "--specpath", str(build), str(ROOT / "gui.py")],
+        "--workpath", str(build / "pyinstaller"), "--specpath", str(build),
+        "--paths", str(SOURCE_DIR), str(SOURCE_DIR / "gui.py")],
         cwd=ROOT, check=True, env=build_env)
     output = ROOT / "dist" / "NetworkGuard"
     shutil.copy2(ROOT / "README.md", output / "README.md")
-    if (ROOT / "LEGACY_REVIEW.md").exists():
-        shutil.copy2(ROOT / "LEGACY_REVIEW.md", output / "LEGACY_REVIEW.md")
+    legacy_review = ROOT / "docs" / "LEGACY_REVIEW.md"
+    if legacy_review.exists():
+        shutil.copy2(legacy_review, output / "LEGACY_REVIEW.md")
     if (ROOT / "LICENSE").exists():
         shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
     if (ROOT / "CHANGELOG.md").exists():

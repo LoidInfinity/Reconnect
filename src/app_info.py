@@ -1,0 +1,53 @@
+"""Release identity and writable runtime paths."""
+import os
+from pathlib import Path
+import sys
+
+VERSION = "0.1.0-beta.3"
+REPOSITORY = "LoidInfinity/Reconnect"
+RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
+FROZEN = bool(getattr(sys, "frozen", False))
+# 源码布局：<repo>/src/app_info.py；打包后：<dist>/NetworkGuard/_internal/app_info.py
+SOURCE_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else SOURCE_DIR.parent
+# 运行时数据集中在一个目录：源码版是 <repo>/data，打包版是 %LOCALAPPDATA%\NetworkGuard
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "NetworkGuard" if FROZEN else APP_DIR / "data"
+LOG_DIR = DATA_DIR / "logs"
+LOG_NAME = "network_guard.log"
+# 配置里保存相对 DATA_DIR 的路径，整个数据目录可以整体搬迁
+LOG_SUBPATH = f"logs/{LOG_NAME}"
+LEGACY_RUNTIME_FILES = ("network_guard_config.json", "network_guard_state.txt", "network_guard.pid")
+
+
+def _move_if_missing(source: Path, target: Path) -> None:
+    try:
+        if source.is_file() and not target.exists():
+            source.replace(target)
+    except OSError:
+        pass
+
+
+def migrate_legacy_layout() -> None:
+    """把旧版本散落在程序目录里的运行时文件收进 DATA_DIR。
+
+    早期版本把配置、状态、PID 和日志直接写在仓库根目录，日志一多就很乱。
+    这里做一次性搬迁；失败也不影响启动，文件之后会在新位置重新生成。
+    """
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    if DATA_DIR != APP_DIR:
+        # 源码版：旧文件留在仓库根目录
+        for name in LEGACY_RUNTIME_FILES:
+            _move_if_missing(APP_DIR / name, DATA_DIR / name)
+    # 日志：源码版旧位置是仓库根目录，打包版旧位置是数据目录本身
+    for origin in {APP_DIR, DATA_DIR}:
+        for old in sorted(origin.glob(f"{LOG_NAME}*")):
+            _move_if_missing(old, LOG_DIR / old.name)
+
+
+def worker_command(config_path: Path) -> list[str]:
+    prefix = [sys.executable] if FROZEN else [sys.executable, "-u", str(SOURCE_DIR / "gui.py")]
+    return prefix + ["--worker", "--config", str(config_path)]

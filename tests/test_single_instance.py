@@ -17,8 +17,8 @@ import gui
 import main
 import repairs
 
-# tests/ 上一级才是仓库根目录（main.py / gui.py 所在位置）
-APP_DIR = Path(__file__).resolve().parent.parent
+# tests/ 上一级是仓库根，源码位于 src/
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 
 
 class SingleInstanceTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class SingleInstanceTests(unittest.TestCase):
         script = textwrap.dedent(
             f"""
             import sys, time
-            sys.path.insert(0, r"{APP_DIR}")
+            sys.path.insert(0, r"{SRC_DIR}")
             import repairs
             print("ACQUIRED" if repairs.acquire_single_instance({name!r}) else "BUSY", flush=True)
             time.sleep(20)

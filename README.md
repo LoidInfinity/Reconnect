@@ -2,7 +2,7 @@
 
 Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重”自动修复有线和无线连接。
 
-当前版本 **0.1.0-beta.3** · [更新记录](CHANGELOG.md) · [与初始脚本对照](LEGACY_REVIEW.md)
+当前版本 **0.1.0-beta.3** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md)
 
 ## 两种启动方式
 
@@ -11,7 +11,7 @@ Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重
 双击 `start_gui.bat`，或执行：
 
 ```powershell
-python gui.py
+python src/gui.py
 ```
 
 可视化设置、实时日志、逐条控制哪些 Wi-Fi 参与恢复，适合日常使用。
@@ -21,11 +21,11 @@ python gui.py
 双击 `start_cli.bat`，或执行：
 
 ```powershell
-python main.py              # 前台运行，Ctrl+C 停止
-python main.py --verbose    # 控制台同时输出调试日志
+python src/main.py              # 前台运行，Ctrl+C 停止
+python src/main.py --verbose    # 控制台同时输出调试日志
 ```
 
-适合服务器、开机脚本或不想开窗口的场景，日志同样写入 `network_guard.log`。
+适合服务器、开机脚本或不想开窗口的场景，日志同样写入 `data\logs\network_guard.log`。
 
 两种方式共用同一把单实例锁，同一时间只能有一个守护在操作网络：重复启动 CLI 直接以返回码 2 退出，GUI 的“启动守护”会提示已有实例，重复双击 GUI 只保留一个窗口。
 
@@ -56,20 +56,21 @@ python main.py --verbose    # 控制台同时输出调试日志
 ## 仓库结构
 
 ```
-gui.py / main.py                     GUI 与 CLI 两个入口
-repairs.py                           网络修复动作（DNS、代理、有线、Wi-Fi、网卡重置）
-updates.py                           检查 GitHub Release 更新
-app_info.py                          版本号与可写数据目录
-build.py                             PyInstaller 打包脚本
+src/
+  gui.py / main.py                   GUI 与 CLI 两个入口
+  repairs.py                         网络修复动作（DNS、代理、有线、Wi-Fi、网卡重置）
+  updates.py                         检查 GitHub Release 更新
+  app_info.py                        版本号与可写数据目录
+  build.py                           PyInstaller 打包脚本
 tests/                               单元测试与版本一致性校验
+config/network_guard_config.example.json   配置模板（不含真实信息）
+docs/LEGACY_REVIEW.md                与初始脚本的对照
 start_gui.bat / start_cli.bat        双击启动
 install_admin_task.bat / enable_wlan.bat   开机自启 / 手动启用无线网卡
-network_guard_config.example.json    配置模板（不含真实信息）
-CHANGELOG.md / LEGACY_REVIEW.md      更新记录 / 与初始脚本的对照
-LICENSE
+requirements-build.txt / CHANGELOG.md / LICENSE
 ```
 
-不会入库的内容：真实配置 `network_guard_config.json`、日志与 PID、`dist/`、`build/`、`.vscode/`、`*.code-workspace`。
+运行时自动生成的全部内容都收在 `data/`（配置、状态、PID，以及 `data\logs\` 下的日志），不会弄脏项目目录，也不入库；同理不入库的还有 `dist/`、`build/`、`.vscode/`、`*.code-workspace`。
 
 ## 构建与测试
 
@@ -78,14 +79,14 @@ LICENSE
 ```powershell
 python -m pip install -r requirements-build.txt
 python -m unittest discover -s tests -t . -p "test_*.py"   # 全部用例
-python build.py                                            # 生成 dist/ 目录 + ZIP + SHA-256
+python src/build.py                                        # 生成 dist/ 目录 + ZIP + SHA-256
 ```
 
 打包版无需安装 Python，解压后双击 `NetworkGuard.exe`，请保留同目录的 `_internal` 文件夹。
 
 ### 发布新版本
 
-改好 `app_info.py` 里的 `VERSION` 与 `CHANGELOG.md`，提交后打标签推送：
+改好 `src/app_info.py` 里的 `VERSION` 与 `CHANGELOG.md`，提交后打标签推送：
 
 ```powershell
 git tag -a v0.1.0-beta.3 -m "0.1.0-beta.3"
@@ -124,33 +125,35 @@ git push origin v0.1.0-beta.3
 | `--export-logs [目录]` | 把最近的日志打包成 ZIP 后退出 |
 | `--save-default-config` | 生成默认配置后退出 |
 
-默认先修有线再修无线；没有有线网卡时自动跳过。完整参数见 `python main.py --help`。
+默认先修有线再修无线；没有有线网卡时自动跳过。完整参数见 `python src/main.py --help`。
 
 ## 开机自启
 
-右键以管理员身份运行 `install_admin_task.bat`：创建最高权限的登录计划任务 `NetworkGuard`，以无窗口方式运行 `gui.py --worker`，并清理旧的 `start_network_guard.bat`。
+右键以管理员身份运行 `install_admin_task.bat`：创建最高权限的登录计划任务 `NetworkGuard`，以无窗口方式运行 `src\gui.py --worker`，并清理旧的 `start_network_guard.bat`。
 
 重置网卡、修改网卡 DNS 需要管理员权限；系统代理开关通常不需要。无权限时会记录失败原因。
 
 ## 文件位置
 
-| 运行方式 | 配置 / 日志 / 状态 / PID |
-| --- | --- |
-| 源码运行 | 项目目录（相对路径以程序目录为基准，开机自启不会写错位置） |
-| 打包运行 | `%LOCALAPPDATA%\NetworkGuard` |
+| 运行方式 | 数据目录（配置 / 状态 / PID） | 日志 |
+| --- | --- | --- |
+| 源码运行 | `data\` | `data\logs\` |
+| 打包运行 | `%LOCALAPPDATA%\NetworkGuard` | `%LOCALAPPDATA%\NetworkGuard\logs\` |
+
+相对路径以数据目录为基准，因此开机自启（工作目录往往是 `System32`）也不会写错位置。旧版本散落在项目根目录的文件会在首次启动时自动迁移到上述位置。
 
 ## 隐私说明
 
 - 日志中的 SSID、AP BSSID、网卡物理地址与 GUID 会被替换为 `<redacted>` / `<mac>` / `<guid>`，界面仍正常显示。
 - 检测地址与 DNS 监测域名均为公共站点，不含个人或单位内部域名。
-- 配置、日志、状态、PID 均被 `.gitignore` 排除。需要版本化配置时请提交不含真实信息的 `network_guard_config.example.json`；真实配置中的 Wi-Fi 名称与内网地址不应入库。
+- 配置、日志、状态、PID 均被 `.gitignore` 排除。需要版本化配置时请提交不含真实信息的 `config/network_guard_config.example.json`；真实配置中的 Wi-Fi 名称与内网地址不应入库。
 
 ## 反馈问题
 
 遇到无法自动恢复的断网时，请把日志发来：
 
 - **界面** — 点左侧栏「遇到问题」，弹窗里已经写明将生成的压缩包名（如 `NetworkGuard-logs-20261121-204831.zip`）。点「打包日志」即可生成，点「打开日志文件夹」可直接定位文件。
-- **终端** — 运行 `python main.py --export-logs`（可指定目录：`--export-logs D:\temp`），命令会打印生成的文件名。
+- **终端** — 运行 `python src/main.py --export-logs`（可指定目录：`--export-logs D:\temp`），命令会打印生成的文件名。
 
 压缩包内含最近的日志（含轮转备份，已脱敏）和一份诊断说明，**不包含配置文件**（配置文件含个人 Wi-Fi 名称）。
 

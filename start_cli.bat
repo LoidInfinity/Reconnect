@@ -2,7 +2,7 @@
 rem ============================================================
 rem  Network Guard - CLI (terminal) mode launcher
 rem  Runs the monitor loop inside this console window.
-rem  Press Ctrl+C to stop. Logs also go to network_guard.log.
+rem  Press Ctrl+C to stop. Logs also go to data\logs\network_guard.log.
 rem
 rem  Usage:
 rem    start_cli.bat                        (use config in this folder)
@@ -17,7 +17,7 @@ if not exist "%PY%" set "PY=python"
 
 echo Network Guard (CLI mode). Press Ctrl+C to stop.
 echo.
-"%PY%" "%~dp0main.py" %*
+"%PY%" "%~dp0src\main.py" %*
 set "CODE=%errorlevel%"
 
 echo.

@@ -107,6 +107,8 @@ class DefaultConfigTests(unittest.TestCase):
             self.assertIn(key, data)
         # Defaults must not point at a machine-specific path or a private domain.
         self.assertFalse(Path(data["log_file"]).is_absolute())
+        # 日志统一放在数据目录的 logs/ 子目录，避免和配置混在一起
+        self.assertEqual(data["log_file"], main.LOG_SUBPATH)
         self.assertEqual(data["disabled_profiles"], [])
         self.assertEqual(data["dns_check_hosts"], list(main.DEFAULT_DNS_HOSTS))
 

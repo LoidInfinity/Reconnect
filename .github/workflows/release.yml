@@ -41,7 +41,7 @@ jobs:
       - name: Verify tag matches app_info.VERSION
         shell: pwsh
         run: |
-          $version = & python -c "import app_info; print(app_info.VERSION)"
+          $version = & python -c "import sys; sys.path.insert(0, 'src'); import app_info; print(app_info.VERSION)"
           if ($LASTEXITCODE -ne 0) { throw "无法导入 app_info，请检查是否有语法错误" }
           $version = "$version".Trim()
           $tag = "$env:RELEASE_TAG".Trim() -replace '^v', ''
@@ -74,7 +74,7 @@ jobs:
           Write-Host '全部测试通过'
 
       - name: Build distribution
-        run: python build.py
+        run: python src/build.py
 
       - name: Show artifacts
         shell: pwsh

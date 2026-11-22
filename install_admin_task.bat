@@ -23,8 +23,8 @@ rem Prefer the bundled interpreter, fall back to pythonw on PATH.
 set "PYW=%~dp0.conda\pythonw.exe"
 if not exist "%PYW%" set "PYW=pythonw.exe"
 
-set "APP=%~dp0gui.py"
-set "CFG=%~dp0network_guard_config.json"
+set "APP=%~dp0src\gui.py"
+set "CFG=%~dp0data\network_guard_config.json"
 
 echo.
 echo [1/4] Stopping any running Network Guard worker...
@@ -54,7 +54,7 @@ echo.
 echo [4/4] Starting the worker now (same privilege as this window)...
 if exist "%APP%" (
     start "" /min "%PYW%" "%APP%" --worker --config "%CFG%"
-    echo       [OK] Started. See network_guard.log for output.
+    echo       [OK] Started. See data\logs\network_guard.log for output.
 ) else (
     echo       [FAIL] gui.py not found next to this script.
 )

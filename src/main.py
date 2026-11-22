@@ -16,12 +16,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import repairs
-from app_info import DATA_DIR, VERSION
+from app_info import DATA_DIR, LOG_DIR, LOG_NAME, LOG_SUBPATH, VERSION, migrate_legacy_layout
 
 
 APP_NAME = "network_guard"
 DEFAULT_CONFIG_FILE = DATA_DIR / "network_guard_config.json"
-DEFAULT_LOG_FILE = DATA_DIR / "network_guard.log"
+DEFAULT_LOG_FILE = LOG_DIR / LOG_NAME
 DEFAULT_STATE_FILE = DATA_DIR / "network_guard_state.txt"
 DEFAULT_PID_FILE = DATA_DIR / "network_guard.pid"
 DEFAULT_CHECK_TARGETS = (
@@ -45,6 +45,9 @@ def migrate_config(data: dict[str, Any]) -> dict[str, Any]:
 		data["dns_check_hosts"] = list(DEFAULT_DNS_HOSTS)
 	if "enabled_profiles" not in data and data.get("allowed_profiles"):
 		data["enabled_profiles"] = data["allowed_profiles"]
+	if data.get("log_file") == LOG_NAME:
+		# 旧版本把日志放在数据目录根下，现在统一收进 logs/ 子目录
+		data["log_file"] = LOG_SUBPATH
 	return data
 
 _MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
@@ -100,7 +103,7 @@ def save_default_config(config_file: Path) -> None:
 		"preferred_profiles": [],
 		"disabled_profiles": [],
 		"interface": None,
-		"log_file": DEFAULT_LOG_FILE.name,
+		"log_file": LOG_SUBPATH,
 		"log_max_bytes": 2 * 1024 * 1024,
 		"log_backup_count": 5,
 		"state_file": DEFAULT_STATE_FILE.name,
@@ -960,6 +963,7 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 
 
 def main() -> None:
+	migrate_legacy_layout()
 	parser = build_arg_parser()
 	args = parser.parse_args()
 	
