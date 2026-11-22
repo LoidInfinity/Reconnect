@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import repairs
-from app_info import DATA_DIR, LOG_DIR, LOG_NAME, LOG_SUBPATH, VERSION, migrate_legacy_layout
+from app_info import (DATA_DIR, LOG_DIR, LOG_NAME, LOG_SUBPATH, VERSION,
+                      clear_internet_marks_async, migrate_legacy_layout)
 
 
 APP_NAME = "network_guard"
@@ -964,6 +965,7 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 
 def main() -> None:
 	migrate_legacy_layout()
+	clear_internet_marks_async()
 	parser = build_arg_parser()
 	args = parser.parse_args()
 	

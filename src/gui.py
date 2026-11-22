@@ -785,6 +785,7 @@ class SupportDialog(tk.Toplevel):
 
 def main():
     guard.migrate_legacy_layout()
+    guard.clear_internet_marks_async()
     parser = argparse.ArgumentParser(description="Network Guard 图形界面")
     parser.add_argument("--config", type=Path, default=guard.DEFAULT_CONFIG_FILE)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)

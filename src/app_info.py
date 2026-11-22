@@ -51,3 +51,51 @@ def migrate_legacy_layout() -> None:
 def worker_command(config_path: Path) -> list[str]:
     prefix = [sys.executable] if FROZEN else [sys.executable, "-u", str(SOURCE_DIR / "gui.py")]
     return prefix + ["--worker", "--config", str(config_path)]
+
+
+def clear_internet_marks(directory: Path | None = None) -> int:
+    """删除浏览器下载时附加的 Zone.Identifier 数据流。
+
+    Windows 用它判断文件"来自 Internet"，双击 .bat / .exe 会弹出
+    「无法验证发布者…没有有效的数字签名」。`.bat` 无法代码签名，所以只能把
+    标记去掉。返回清理掉的文件数。
+    """
+    target = directory or APP_DIR
+    removed = 0
+    try:
+        entries = list(target.rglob("*"))
+    except OSError:
+        return 0
+    for path in entries:
+        try:
+            if not path.is_file():
+                continue
+            mark = f"{path}:Zone.Identifier"
+            if os.path.exists(mark):
+                os.remove(mark)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def clear_internet_marks_async() -> None:
+    """后台清理一次，成功后再双击启动就不会再弹安全警告。
+
+    源码运行时程序目录里有 .git / dist / build，逐文件扫描代价大且没有意义，
+    只在打包版执行。
+    """
+    if not FROZEN:
+        return
+    import threading
+
+    def run() -> None:
+        try:
+            clear_internet_marks()
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
