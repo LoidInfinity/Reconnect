@@ -75,6 +75,7 @@ class RecoveryTests(unittest.TestCase):
              patch.object(repairs, "repair_dns", return_value=True) as dns, \
              patch.object(repairs, "get_up_interface_names") as discover, \
              patch.object(main, "is_internet_reachable", return_value=True), \
+             patch.object(repairs, "wifi_radio_state", return_value="on"), \
              patch.object(repairs, "clear_proxy_settings") as proxy:
             self.assertTrue(main.recover_network(logging.getLogger("test"), None, [], Path("unused"), 35,
                 [], repair_dns_enabled=True, cleanup_proxy=True, dns_check_hosts=["example.org"],
@@ -85,6 +86,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_no_wifi_enabled_never_resets_adapter(self):
         with patch.object(main, "ping_reachable", return_value=True), \
+             patch.object(repairs, "wifi_radio_state", return_value="on"), \
              patch.object(main, "get_wifi_interfaces", return_value=[]), \
              patch.object(main, "get_saved_profiles", return_value=["Home"]), \
              patch.object(main, "read_state_file", return_value="Home"), \

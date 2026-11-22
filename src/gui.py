@@ -52,7 +52,7 @@ def read_settings(path: Path) -> dict:
                     prevent_sleep=True, cleanup_proxy_on_disconnect=True,
                     repair_dns_on_failure=True, dns_check_hosts=list(guard.DEFAULT_DNS_HOSTS), dns_reset_interfaces=[],
                     wired_recovery=True, wired_reset_on_failure=True,
-                    wifi_recovery=True, adapter_reset_on_failure=True)
+                    wifi_recovery=True, wifi_radio_recovery=True, adapter_reset_on_failure=True)
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
@@ -79,7 +79,7 @@ def validate_settings(data: dict) -> dict:
         result[key] = value
     for key in ("prevent_sleep", "cleanup_proxy_on_disconnect", "repair_dns_on_failure",
                 "wired_recovery", "wired_reset_on_failure",
-                "wifi_recovery", "adapter_reset_on_failure"):
+                "wifi_recovery", "wifi_radio_recovery", "adapter_reset_on_failure"):
         if not isinstance(data.get(key, True), bool):
             raise ValueError(f"{key} 必须是 true 或 false")
         result[key] = data.get(key, True)
@@ -166,14 +166,17 @@ def worker(config_path: Path) -> None:
 def _monitor_worker(config_path, config, logger):
     state_path = guard.resolve_path(config["state_file"])
     attempts = successes = 0
-    repair_stats = {"dns_repairs": 0, "proxy_cleanups": 0}
+    radio_alerted = False
+    repair_stats = {"dns_repairs": 0, "proxy_cleanups": 0, "wired_repairs": 0,
+                    "radio_repairs": 0, "radio_blocked": 0}
     last_heartbeat = time.monotonic()
     logger.info("守护已启动，检测间隔 %s 秒", config["interval"])
-    logger.info("自动修复：代理清理 %s，DNS 修复 %s，有线修复 %s，Wi-Fi 重连 %s，网卡重置 %s",
+    logger.info("自动修复：代理清理 %s，DNS 修复 %s，有线修复 %s，Wi-Fi 重连 %s，无线电恢复 %s，网卡重置 %s",
                 "开" if config["cleanup_proxy_on_disconnect"] else "关",
                 "开" if config["repair_dns_on_failure"] else "关",
                 "开" if config["wired_recovery"] else "关",
                 "开" if config["wifi_recovery"] else "关",
+                "开" if config["wifi_radio_recovery"] else "关",
                 "开" if config["adapter_reset_on_failure"] else "关")
     while True:
         try:
@@ -204,8 +207,14 @@ def _monitor_worker(config_path, config, logger):
                     adapter_reset=config["adapter_reset_on_failure"],
                     wired_recovery=config["wired_recovery"],
                     wired_reset=config["wired_reset_on_failure"] and config["adapter_reset_on_failure"],
-                    dns_reset_interfaces=config["dns_reset_interfaces"], repair_stats=repair_stats)
+                    dns_reset_interfaces=config["dns_reset_interfaces"], repair_stats=repair_stats,
+                    radio_recovery=config["wifi_radio_recovery"])
                 successes += int(online)
+                if online:
+                    radio_alerted = False
+                elif repair_stats.get("radio_blocked") and not radio_alerted:
+                    emit("status", text="无线被系统关闭且无可用有线 · 请手动打开 Wi-Fi", tone="error")
+                    radio_alerted = True
             interfaces = guard.get_wifi_interfaces(logger, config["interface"])
             emit("result", online=online, attempts=attempts, successes=successes, **repair_stats,
                  interfaces=[vars(item) for item in interfaces], checked=time.strftime("%H:%M:%S"))
@@ -386,6 +395,7 @@ class GuardApp:
             ("repair_dns_on_failure", "修复 DNS（清空缓存 + 网卡 DNS 回退自动获取）"),
             ("wired_recovery", "先修复有线连接（DHCP 续约，解决拿不到 IP 地址）"),
             ("wifi_recovery", "再重连已保存的 Wi-Fi（有线恢复不了才走这一步）"),
+            ("wifi_radio_recovery", "无线被关闭时自动打开无线电（飞行模式/Wi-Fi 开关被关）"),
             ("adapter_reset_on_failure", "全部失败后禁用/启用网卡（需管理员权限）"),
             ("prevent_sleep", "守护期间阻止系统休眠"),
         ):

@@ -59,6 +59,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_all_disabled_does_not_connect(self):
         with patch.object(gui.guard, "ping_reachable", return_value=True), \
+             patch.object(gui.guard.repairs, "wifi_radio_state", return_value="on"), \
              patch.object(gui.guard, "get_wifi_interfaces", return_value=[]), \
              patch.object(gui.guard, "get_saved_profiles", return_value=["Home"]), \
              patch.object(gui.guard, "read_state_file", return_value="Home"), \

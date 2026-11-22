@@ -295,6 +295,7 @@ def get_physical_adapters(logger) -> list[dict[str, str]]:
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
         "[pscustomobject]@{ "
         "Name = $_.Name; Status = $_.Status; MediaType = $_.MediaType; "
+        "MediaConnectState = $_.MediaConnectState; "
         "IP = $ip.IPAddress; Gateway = $gw.NextHop } "
         "} | ConvertTo-Json -Compress -Depth 3"
     )
@@ -336,21 +337,84 @@ def is_link_healthy(adapter: dict) -> bool:
     return bool(address) and not is_apipa(address) and bool(adapter.get("Gateway"))
 
 
-def renew_dhcp(logger, interface_name: str) -> bool:
+# Link states that mean "there is no cable/carrier at all", so DHCP cannot
+# possibly succeed. Marked separately from "up but no lease" because renewing a
+# lease on an unplugged cable only burns the recovery budget.
+_MEDIA_DOWN_STATUSES = {
+    "disconnected", "disabled", "not present",
+    "已断开连接", "已禁用", "媒体已断开连接", "未连接", "已拔出", "硬件未连接",
+}
+
+
+def is_wired_media_down(adapter: dict) -> bool:
+    """True when a wired adapter has no carrier, so lease repair is pointless."""
+    status = str(adapter.get("Status") or "").strip().casefold()
+    if status in _MEDIA_DOWN_STATUSES:
+        return True
+    return str(adapter.get("MediaConnectState") or "").strip().casefold() == "disconnected"
+
+
+def has_admin_privileges() -> bool:
+    """Whether this process can disable/enable adapters."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001 - non-Windows or restricted token
+        return False
+
+
+def renew_dhcp(logger, interface_name: str, reason: list[str] | None = None) -> bool:
     """Release/renew the lease so an APIPA address can be replaced.
 
     This is the repair for "cable is plugged in but there is no IPv4
     address": DNS resets cannot fix a missing lease.
+
+    ``reason`` receives ``ok`` / ``static`` / ``nomedia`` / ``failed`` so the
+    caller can tell "retrying is pointless" from "the lease attempt failed".
     """
+    def _mark(tag: str) -> None:
+        if reason is not None:
+            reason.append(tag)
+
     if not interface_name:
         return False
     logger.warning("⚠ 对网卡 '%s' 执行 DHCP 续约…", interface_name)
     _run(["ipconfig", "/release", interface_name], logger, 20)
     time.sleep(1)
     completed = _run(["ipconfig", "/renew", interface_name], logger, 40)
+    output = f"{completed.stdout or ''}\n{completed.stderr or ''}".casefold()
+    # A statically addressed adapter answers "DHCP is not enabled". Resetting it
+    # afterwards cannot help either, so report it instead of retrying blindly.
+    if any(
+        marker in output
+        for marker in (
+            "没有为 dhcp 启用",
+            "未启用 dhcp",
+            "not enabled for dhcp",
+            "dhcp is not enabled",
+            "does not have dhcp enabled",
+        )
+    ):
+        _mark("static")
+        logger.warning(
+            "网卡 '%s' 使用静态 IP（未启用 DHCP），续约无法恢复；请检查网线、静态地址与网关配置。",
+            interface_name,
+        )
+        return False
+    if any(
+        marker in output
+        for marker in ("已断开媒体连接", "media disconnected", "网络电缆被拔出", "media state")
+    ):
+        _mark("nomedia")
+        logger.warning(
+            "网卡 '%s' 没有链路（网线未插或网卡被禁用），续约无法执行，跳过该网卡的后续重置。",
+            interface_name,
+        )
+        return False
     if completed.returncode == 0:
+        _mark("ok")
         logger.info("✓ 网卡 '%s' DHCP 续约命令已完成", interface_name)
         return True
+    _mark("failed")
     logger.warning("网卡 '%s' DHCP 续约返回码: %s", interface_name, completed.returncode)
     return False
 
@@ -431,7 +495,20 @@ def repair_wired_links(logger, allow_reset: bool = False,
         logger.info("有线连接正常（已获得有效 IP 与网关）。")
         return False
 
-    for adapter in unhealthy:
+    # Split "no carrier" from "carrier but no lease": a macap-free cable cannot
+    # answer DHCP, and resetting it needs admin rights for nothing.
+    media_down = [item for item in unhealthy if is_wired_media_down(item)]
+    repairable = [item for item in unhealthy if not is_wired_media_down(item)]
+    for adapter in media_down:
+        logger.info(
+            "有线网卡 '%s' 媒体未连接（状态=%s），跳过续约与重置。",
+            adapter.get("Name") or "?",
+            adapter.get("Status") or "?",
+        )
+    if not repairable:
+        return False
+
+    for adapter in repairable:
         name = str(adapter.get("Name") or "")
         if not name:
             continue
@@ -443,13 +520,24 @@ def repair_wired_links(logger, allow_reset: bool = False,
             adapter.get("Gateway") or "无",
             "（DHCP 未响应，已回退 APIPA）" if is_apipa(adapter.get("IP")) else "",
         )
-        renew_dhcp(logger, name)
-        refreshed = get_physical_adapters(logger)
-        mine = next((x for x in refreshed if x.get("Name") == name), None)
-        if mine and is_link_healthy(mine):
-            logger.info("✓ 有线网卡 '%s' 已恢复有效租约。", name)
-            return True
+        cause: list[str] = []
+        renewed = renew_dhcp(logger, name, cause)
+        if renewed:
+            refreshed = get_physical_adapters(logger)
+            mine = next((x for x in refreshed if x.get("Name") == name), None)
+            if mine and is_link_healthy(mine):
+                logger.info("✓ 有线网卡 '%s' 已恢复有效租约。", name)
+                return True
+        elif cause and cause[-1] in ("static", "nomedia"):
+            # 静态 IP / 没有链路：重置也治不好，不再浪费一次必然失败的提权。
+            continue
         if allow_reset:
+            if not has_admin_privileges():
+                logger.warning(
+                    "需要管理员权限才能重置有线网卡 '%s'，已跳过；可运行 install_admin_task.bat 后重启守护。",
+                    name,
+                )
+                continue
             logger.warning("DHCP 续约未能恢复 '%s'，尝试重置该网卡…", name)
             if _reset_named_adapter(logger, name):
                 renew_dhcp(logger, name)
@@ -458,6 +546,139 @@ def repair_wired_links(logger, allow_reset: bool = False,
                 if mine and is_link_healthy(mine):
                     logger.info("✓ 有线网卡 '%s' 重置后已恢复。", name)
                     return True
+    return False
+
+
+# ------------------------------------------------------------- wireless radio
+
+# "Software radio off" (飞行模式 / Wi-Fi 开关被关 / 驱动进入低功耗状态) is invisible
+# to a plain reconnect: ``netsh wlan connect`` answers 0x80342002 ("the wireless
+# LAN interface is powered off") and every candidate fails while the hardware
+# switch still reads On. The WinRT radio API works from an ordinary non-admin
+# process, so the outage is repairable without elevation.
+_RADIO_PS_PRELUDE = r"""$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($WinRtTask, $ResultType) {
+  $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+  $netTask = $asTask.Invoke($null, @($WinRtTask))
+  if (-not $netTask.Wait(8000)) { throw 'WINRT_TIMEOUT' }
+  $netTask.Result
+}
+[Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType = WindowsRuntime] | Out-Null
+$radioList = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+$wifiRadios = @($radioList | Where-Object { $_.Kind -eq 'WiFi' })
+if ($wifiRadios.Count -eq 0) { Write-Output 'NO_WIFI_RADIO'; exit 0 }
+"""
+
+_RADIO_STATE_BODY = (
+    "foreach ($radio in $wifiRadios) { Write-Output ('STATE|' + $radio.State) }"
+)
+
+_RADIO_ENABLE_BODY = """foreach ($radio in $wifiRadios) {
+  if ($radio.State -ne 'On') {
+    $access = Await ($radio.SetStateAsync([Windows.Devices.Radios.RadioState]::On)) ([Windows.Devices.Radios.RadioAccessStatus])
+    Write-Output ('SET|' + $access)
+  }
+}
+Start-Sleep -Milliseconds 800
+$afterRadios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+foreach ($radio in @($afterRadios | Where-Object { $_.Kind -eq 'WiFi' })) { Write-Output ('AFTER|' + $radio.State) }
+"""
+
+# A failed probe is cached: a desktop without a Wi-Fi radio must not spawn a
+# PowerShell call on every recovery cycle. A readable state is never cached
+# because the radio can be toggled outside this program.
+_RADIO_PROBE_TTL = 300.0
+_radio_cache: dict[str, Any] = {"state": None, "at": 0.0}
+
+
+def _radio_values(text: str, prefix: str) -> list[str]:
+    values: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.upper().startswith(prefix.upper()):
+            values.append(line.split("|", 1)[-1].strip())
+    return values
+
+
+def wifi_radio_state(logger) -> str | None:
+    """Return ``on`` / ``off`` / ``disabled`` / ``absent``, or None when unknown.
+
+    ``disabled`` means Windows or the driver marked the radio unusable (physical
+    switch, airplane mode policy); ``off`` is the ordinary software switch.
+    """
+    cached = _radio_cache.get("state")
+    if cached in (None, "absent") and time.time() - float(_radio_cache.get("at") or 0) < _RADIO_PROBE_TTL:
+        return cached
+
+    completed = _run(
+        ["powershell", "-NoProfile", "-Command", _RADIO_PS_PRELUDE + _RADIO_STATE_BODY],
+        logger,
+        20,
+    )
+    text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    states = [value.casefold() for value in _radio_values(text, "STATE|")]
+
+    result: str | None
+    if "NO_WIFI_RADIO" in text:
+        result = "absent"
+        logger.debug("系统中没有 Wi-Fi 无线电设备。")
+    elif not states:
+        result = None
+        logger.debug("无法读取 Wi-Fi 无线电状态: %s", text.strip()[:200] or "(无输出)")
+    elif "disabled" in states:
+        result = "disabled"
+    elif "off" in states:
+        result = "off"
+    elif "on" in states:
+        result = "on"
+    else:
+        result = states[0]
+
+    if result in (None, "absent"):
+        _radio_cache.update(state=result, at=time.time())
+    return result
+
+
+def enable_wifi_radio(logger) -> bool:
+    """Turn the Wi-Fi radio back on. True only when it is confirmed On."""
+    logger.warning("⚠ 尝试重新打开 Wi-Fi 无线电…")
+    completed = _run(
+        ["powershell", "-NoProfile", "-Command", _RADIO_PS_PRELUDE + _RADIO_ENABLE_BODY],
+        logger,
+        25,
+    )
+    text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if "NO_WIFI_RADIO" in text:
+        logger.warning("未找到 Wi-Fi 无线电设备，无法自动打开无线。")
+        return False
+
+    denied = [
+        value
+        for value in _radio_values(text, "SET|")
+        if value.casefold().startswith("denied")
+    ]
+    set_attempts = _radio_values(text, "SET|")
+    after = [value.casefold() for value in _radio_values(text, "AFTER|")]
+    if after and all(state == "on" for state in after):
+        _radio_cache.update(state="on", at=time.time())
+        if denied:
+            logger.warning("无线电开关曾被系统拒绝（%s），但当前已为开启状态。", ", ".join(denied))
+        elif set_attempts:
+            logger.info("✓ 已重新打开 Wi-Fi 无线电。")
+        else:
+            logger.info("✓ Wi-Fi 无线电已处于开启状态。")
+        return True
+    if denied:
+        logger.error(
+            "⛔ 系统拒绝打开 Wi-Fi 无线电（%s）：请检查飞行模式、物理开关或组策略。",
+            ", ".join(denied),
+        )
+    elif after:
+        logger.warning("Wi-Fi 无线电仍处于关闭状态（%s），可能需要手动打开。", ", ".join(after))
+    else:
+        logger.warning("无法确认 Wi-Fi 无线电状态，继续尝试重连。")
     return False
 
 

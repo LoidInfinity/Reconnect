@@ -83,6 +83,59 @@ class WifiInterface:
 	bssid: str | None = None
 	signal: str | None = None
 	profile: str | None = None
+	radio_hardware: str | None = None
+	radio_software: str | None = None
+
+
+def normalize_radio_value(value: str | None) -> str | None:
+	"""Map the localized on/off words to ``on`` / ``off``."""
+	if not value:
+		return None
+	text = value.strip().casefold()
+	if text in ("开", "on", "开启", "已开启"):
+		return "on"
+	if text in ("关", "off", "关闭", "已关闭"):
+		return "off"
+	return None
+
+
+def parse_radio_state(block: str) -> tuple[str | None, str | None]:
+	"""Extract the radio switch state from one ``netsh`` interface block.
+
+	``netsh`` only prints this block while the radio is off::
+
+	    无线电状态           : 硬件 开
+	                             软件 关
+
+	so absence means "no information", never "off".
+	"""
+	if not re.search(r"无线电状态|Radio\s+status", block, re.IGNORECASE):
+		return None, None
+	hardware = re.search(r"(?:硬件|Hardware)\s*[:：]?\s*(开|关|开启|关闭|On|Off)", block, re.IGNORECASE)
+	software = re.search(r"(?:软件|Software)\s*[:：]?\s*(开|关|开启|关闭|On|Off)", block, re.IGNORECASE)
+	return (
+		normalize_radio_value(hardware.group(1)) if hardware else None,
+		normalize_radio_value(software.group(1)) if software else None,
+	)
+
+
+def wifi_radio_off(interfaces: Iterable[WifiInterface]) -> bool:
+	"""True when a Wi-Fi interface reports its radio switched off."""
+	for item in interfaces:
+		if normalize_radio_value(item.radio_software) == "off":
+			return True
+		if normalize_radio_value(item.radio_hardware) == "off":
+			return True
+	return False
+
+
+def _describe_radio_state(state: str | None) -> str:
+	return {
+		"on": "已开启",
+		"off": "已关闭（软件开关），断网且无可用有线时会自动打开",
+		"disabled": "已被系统禁用，需要检查飞行模式/物理开关",
+		"absent": "未检测到 Wi-Fi 无线电设备",
+	}.get(state or "", "未知（无法读取）")
 
 
 def load_config(config_file: Path) -> dict[str, Any]:
@@ -115,6 +168,7 @@ def save_default_config(config_file: Path) -> None:
 		"repair_dns_on_failure": True,
 		"dns_check_hosts": list(DEFAULT_DNS_HOSTS),
 		"wifi_recovery": True,
+		"wifi_radio_recovery": True,
 		"wired_recovery": True,
 		"wired_reset_on_failure": True,
 		"adapter_reset_on_failure": True,
@@ -239,6 +293,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		"--no-wifi-recovery",
 		action="store_true",
 		help="只做代理/DNS/有线修复，不重连 Wi-Fi。",
+	)
+	parser.add_argument(
+		"--no-radio-recovery",
+		action="store_true",
+		help="Wi-Fi 无线电被系统关闭时不自动打开（默认会自动打开并重连）。",
 	)
 	parser.add_argument(
 		"--no-wired-recovery",
@@ -373,10 +432,32 @@ def _execute(command: list[str], logger: logging.Logger, timeout: int | None) ->
 
 
 def decode_output(data: bytes | None, logger: logging.Logger) -> str:
+	"""Decode console output without guessing wrong.
+
+	``netsh`` writes the OEM code page (GBK on Chinese Windows) while other
+	tools emit UTF-8. UTF-16 must only be attempted with a BOM: almost any
+	even-length byte string decodes "successfully" as UTF-16 and turns a GBK
+	``netsh`` summary into mojibake that then fails to parse.
+	"""
 	if not data:
 		return ""
-	encodings = ["gbk", "gb2312", "utf-16", "utf-8", "latin1"]
-	for enc in encodings:
+	if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+		try:
+			text = data.decode("utf-16")
+			if text.strip():
+				logger.debug("成功用编码 utf-16 解码输出")
+				return text
+		except UnicodeDecodeError:
+			logger.debug("带 BOM 的 utf-16 解码失败，改用其他编码")
+	if data.startswith(b"\xef\xbb\xbf"):
+		try:
+			text = data.decode("utf-8-sig")
+			if text.strip():
+				logger.debug("成功用编码 utf-8-sig 解码输出")
+				return text
+		except UnicodeDecodeError:
+			logger.debug("带 BOM 的 utf-8 解码失败，改用其他编码")
+	for enc in ("utf-8", "gbk", "gb18030"):
 		try:
 			text = data.decode(enc)
 			if text.strip():
@@ -430,7 +511,10 @@ def parse_wifi_interfaces(output: str) -> list[WifiInterface]:
 		signal = extract_value(block, ["Signal", "信号"])
 		if name:
 			profile = extract_value(block, ["Profile", "配置文件"])
-			interfaces.append(WifiInterface(name=name, state=state, ssid=ssid, bssid=bssid, signal=signal, profile=profile))
+			radio_hardware, radio_software = parse_radio_state(block)
+			interfaces.append(WifiInterface(name=name, state=state, ssid=ssid, bssid=bssid,
+				signal=signal, profile=profile,
+				radio_hardware=radio_hardware, radio_software=radio_software))
 	return interfaces
 
 
@@ -522,17 +606,38 @@ def get_saved_profiles(logger: logging.Logger) -> list[str]:
 	return deduped
 
 
+_PING_FAILURE_RE = re.compile(
+	r"无法访问目标主机|目标主机不可达|目标网络不可达|传输失败|请求超时|"
+	r"destination (?:host|net(?:work)?) unreachable|general failure|request timed out|"
+	r"100%\s*(?:packet\s*)?loss",
+	re.IGNORECASE,
+)
+_PING_REPLY_RE = re.compile(r"\bTTL[=＝]\s*\d+", re.IGNORECASE)
+
+
 def ping_reachable(logger: logging.Logger, timeout_seconds: int = 2) -> bool:
-	"""链路层是否通：ping 得通公共地址就说明链路（Wi-Fi/以太网）没断。"""
+	"""链路层是否通：ping 得通公共地址就说明链路（Wi-Fi/以太网）没断。
+
+	Windows returns exit code 0 for "无法访问目标主机" replies, so the exit code
+	alone is not proof: a real reply must carry a TTL and no unreachable marker.
+	"""
 	for host in ("223.5.5.5", "119.29.29.29"):
 		try:
 			timeout_ms = max(1, timeout_seconds * 1000)
 			completed = run_command(
 				["ping", "-n", "1", "-w", str(timeout_ms), host], logger, timeout_seconds + 5
 			)
-			if completed.returncode == 0:
-				logger.debug("Ping 检查成功: %s", host)
-				return True
+			if completed.returncode != 0:
+				continue
+			text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+			if _PING_FAILURE_RE.search(text):
+				logger.debug("Ping 未真正到达 %s: %s", host, text.strip()[:120])
+				continue
+			if not _PING_REPLY_RE.search(text):
+				logger.debug("Ping 返回码为 0 但没有有效回复: %s", host)
+				continue
+			logger.debug("Ping 检查成功: %s", host)
+			return True
 		except Exception as exc:  # noqa: BLE001
 			logger.debug("Ping 检查失败: %s, %s", host, exc)
 	return False
@@ -571,6 +676,12 @@ def is_internet_reachable(logger: logging.Logger, targets: Iterable[str], timeou
 	return http_reachable(logger, targets, timeout_seconds)
 
 
+_RADIO_OFF_OUTPUT_RE = re.compile(
+	r"电源关闭|电源已关闭|无线电.{0,6}关|powered\s+off|radio\s+is\s+off|0x80342002|2150899714",
+	re.IGNORECASE,
+)
+
+
 def connect_wifi(profile_name: str, logger: logging.Logger, interface_name: str | None) -> bool:
 	command = ["netsh", "wlan", "connect", f"name={profile_name}"]
 	if interface_name:
@@ -578,7 +689,14 @@ def connect_wifi(profile_name: str, logger: logging.Logger, interface_name: str 
 	logger.debug("发起 Wi-Fi 连接请求: %s", profile_name)
 	completed = run_command(command, logger, timeout=15)
 	if completed.returncode != 0:
-		logger.warning("尝试连接 Wi-Fi 配置失败: %s (返回码: %s)", profile_name, completed.returncode)
+		output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+		if _RADIO_OFF_OUTPUT_RE.search(output):
+			logger.error(
+				"⛔ 系统报告无线接口电源关闭（无线电被关闭），连接请求被拒绝: %s",
+				profile_name,
+			)
+		else:
+			logger.warning("尝试连接 Wi-Fi 配置失败: %s (返回码: %s)", profile_name, completed.returncode)
 		return False
 	logger.info("已发起连接请求: %s", profile_name)
 	return True
@@ -644,8 +762,13 @@ def recover_network(
 	wired_reset: bool = False,
 	dns_reset_interfaces: Iterable[str] | None = None,
 	repair_stats: dict[str, int] | None = None,
+	radio_recovery: bool = True,
 ) -> bool:
-	"""按"DNS → 系统代理 → 有线连接 → Wi-Fi 重连 → 网卡重置"的顺序修复。
+	"""按"无线电 → DNS → 系统代理 → 有线连接 → Wi-Fi 重连 → 网卡重置"修复。
+
+	无线电排在最前：系统把 Wi-Fi 无线电关掉时（飞行模式、Wi-Fi 开关被关、
+	驱动进入低功耗），``netsh wlan connect`` 只会返回 0x80342002，任何配置
+	都连不上，而这一步恰好不需要管理员权限。
 
 	有线优先：全部连接失效时先修有线（DHCP 续约 → 必要时重置网卡），
 	再尝试无线。有线存在不会跳过无线：有线链路修好后 HTTP 仍不可用
@@ -654,6 +777,64 @@ def recover_network(
 	ping 成功只说明 ICMP 可达，不能证明 HTTP 或远控流量正常。
 	"""
 	repaired = False
+	radio_off_at_entry = False
+	radio_blocked = False
+
+	# 硬约束：只要有一条健康的有线链路（Up + 有效 IP + 默认网关），
+	# 本轮就绝不碰无线——不打开无线电、不重连 Wi-Fi、不重置网卡。
+	# 很多笔记本/扩展坞在插网线时无法同时连无线（OEM 会在有线接通时关掉
+	# WLAN 无线电），此时"帮忙"打开无线反而可能把正在工作的有线弄断。
+	adapters: list[dict] = []
+	wired_healthy_at_entry = False
+	if wired_recovery:
+		adapters = repairs.get_physical_adapters(logger)
+		wired_at_entry = [item for item in adapters if repairs.is_wired(item)]
+		wired_healthy_at_entry = any(repairs.is_link_healthy(item) for item in wired_at_entry)
+		if wired_healthy_at_entry:
+			logger.info(
+				"有线连接健康（已获得有效 IP 与网关），本轮不会改动无线电或 Wi-Fi。"
+			)
+
+	def try_radio_repair(reason: str) -> bool:
+		"""Re-enable the radio; True only when HTTP comes back by itself."""
+		nonlocal radio_blocked
+		logger.warning("检测到 Wi-Fi 无线电已关闭（%s），尝试重新打开。", reason)
+		if not repairs.enable_wifi_radio(logger):
+			radio_blocked = True
+			logger.error(
+				"⛔ 无法自动打开 Wi-Fi 无线电（飞行模式、物理开关、组策略或权限限制）。"
+			)
+			if repair_stats is not None:
+				repair_stats["radio_blocked"] = repair_stats.get("radio_blocked", 0) + 1
+			return False
+		for _ in range(5):
+			if is_internet_reachable(logger, check_targets):
+				if repair_stats is not None:
+					repair_stats["radio_repairs"] = repair_stats.get("radio_repairs", 0) + 1
+				logger.info("✓ 重新打开无线电后网络已恢复。")
+				return True
+			time.sleep(3)
+		logger.warning("无线电已打开但网络尚未恢复，继续后续修复。")
+		return False
+
+	def reset_permitted() -> bool:
+		"""Whether resetting the Wi-Fi adapter is allowed by the policy switches."""
+		if not adapter_reset:
+			return False
+		if enabled_profiles is None and not disabled_profiles:
+			return True
+		# 无线电是关的：没有"正在使用的其它配置"会被抢占，重置只剩好处。
+		return radio_off_at_entry or radio_blocked
+
+	# 0) 无线电：被系统关掉时，一切 Wi-Fi 连接请求都会被拒绝。
+	#    有线健康时跳过：有的机器插上网线后 WLAN 会被 OEM 策略关掉，
+	#    那不是故障，硬开无线电可能反过来断掉正在工作的有线。
+	if wifi_recovery and radio_recovery and not wired_healthy_at_entry:
+		radio_state = repairs.wifi_radio_state(logger)
+		if radio_state in ("off", "disabled"):
+			radio_off_at_entry = True
+			if try_radio_repair(radio_state):
+				return True
 
 	# 1) DNS：域名解析失败说明 DNS 被破坏，而不是链路断
 	if repair_dns_enabled:
@@ -668,10 +849,17 @@ def recover_network(
 					logger.warning("DNS 修复后仍有域名解析失败: %s", ", ".join(remaining))
 				else:
 					logger.info("✓ DNS 修复后解析恢复正常。")
-					if repair_stats is not None:
-						repair_stats["dns_repairs"] = repair_stats.get("dns_repairs", 0) + 1
 					if is_internet_reachable(logger, check_targets):
-						logger.info("✓ DNS 修复后网络已恢复，无需继续清理代理。")
+						if radio_off_at_entry:
+							# 无线电刚被重新打开时，链路恢复也会让 DNS 变好，
+							# 不能把这份功劳记到 DNS 修复上。
+							if repair_stats is not None:
+								repair_stats["radio_repairs"] = repair_stats.get("radio_repairs", 0) + 1
+							logger.info("✓ 网络已恢复（本轮无线电曾关闭，按链路恢复统计）。")
+						else:
+							if repair_stats is not None:
+								repair_stats["dns_repairs"] = repair_stats.get("dns_repairs", 0) + 1
+							logger.info("✓ DNS 修复后网络已恢复，无需继续清理代理。")
 						return True
 		else:
 			logger.debug("DNS 解析正常，跳过修复。")
@@ -696,15 +884,25 @@ def recover_network(
 	# 3) 有线连接优先：全部连接失效时先检查/修复有线，再尝试无线。
 	#    典型故障是"网线插着但 DHCP 没给 IPv4 地址"（169.254.x.x），
 	#    这种情况重置 DNS 治不好，必须重新获取租约。
-	wired_healthy_at_entry = False
+	if wired_healthy_at_entry:
+		# 有线本来就能正常上网时绝不动无线：重连 Wi-Fi 会抢占默认路由，
+		# 在只能二选一的机型上还可能直接断开有线。只有全部失效才往下走无线。
+		logger.info("有线连接可用，已跳过无线重连以避免中断现有网络。")
+		return False
+
 	if wired_recovery:
-		adapters = repairs.get_physical_adapters(logger)
 		wired = [item for item in adapters if repairs.is_wired(item)]
-		wired_healthy_at_entry = any(repairs.is_link_healthy(item) for item in wired)
-		if wired_healthy_at_entry:
-			logger.info("有线连接健康（已获得有效 IP 与网关）。")
-		elif wired:
-			if repairs.repair_wired_links(logger, allow_reset=wired_reset, adapters=adapters):
+		if not wired:
+			logger.info("未检测到有线网卡，直接尝试无线连接。")
+		else:
+			media_down = [item for item in wired if repairs.is_wired_media_down(item)]
+			if len(media_down) == len(wired):
+				# 网线未插、网卡被禁用：续约只会立刻失败，白白吃掉重连预算。
+				logger.info(
+					"有线链路全部断开（%s 媒体未连接/网线未插），跳过有线修复，直接尝试无线。",
+					", ".join(str(item.get("Name") or "?") for item in media_down),
+				)
+			elif repairs.repair_wired_links(logger, allow_reset=wired_reset, adapters=adapters):
 				if repair_stats is not None:
 					repair_stats["wired_repairs"] = repair_stats.get("wired_repairs", 0) + 1
 				if is_internet_reachable(logger, check_targets):
@@ -713,16 +911,8 @@ def recover_network(
 				logger.warning("有线链路已修复但 HTTP 仍不可用，继续尝试无线连接。")
 			else:
 				logger.warning("有线连接修复未成功，继续尝试无线连接。")
-		else:
-			logger.info("未检测到有线网卡，直接尝试无线连接。")
 	else:
 		logger.info("有线连接修复已禁用，跳过。")
-
-	# 有线本来就能正常上网时绝不动无线：重连 Wi-Fi 会抢占默认路由，
-	# 可能主动打断一条本来正常的连接。只有全部失效时才往下走无线。
-	if wired_healthy_at_entry:
-		logger.info("有线连接可用，已跳过无线重连以避免中断现有网络。")
-		return False
 
 	if not wifi_recovery:
 		logger.info("Wi-Fi 重连恢复已禁用，跳过。")
@@ -739,19 +929,38 @@ def recover_network(
 	else:
 		logger.warning("未识别到可用的 Wi-Fi 网卡（netsh 可能已超时或网卡卡死）。")
 
+	# WinRT 探测失败（旧系统/被禁用）时，netsh 的"无线电状态"是最后的线索。
+	if (
+		wifi_recovery
+		and radio_recovery
+		and not radio_off_at_entry
+		and interfaces
+		and wifi_radio_off(interfaces)
+	):
+		radio_off_at_entry = True
+		if try_radio_repair("netsh 报告无线电关闭"):
+			return True
+
 	saved_profiles = get_saved_profiles(logger)
 	last_successful = read_state_file(state_file)
 	candidates = choose_profiles_to_try(preferred_profiles, last_successful, saved_profiles, disabled_profiles, enabled_profiles)
 
 	if not candidates:
 		logger.warning("没有可参与恢复的 Wi-Fi 配置（未保存配置或已全部禁用）。")
-		# Resetting an adapter can auto-join an excluded profile. Respect the
-		# participation switches even when profile discovery fails.
-		if adapter_reset and enabled_profiles is None and not disabled_profiles:
+		if reset_permitted():
 			logger.info("无可用配置，尝试硬件重置 Wi-Fi 网卡…")
 			if repairs.reset_wifi_adapter(logger):
 				time.sleep(10)
-				return is_internet_reachable(logger, check_targets)
+				if is_internet_reachable(logger, check_targets):
+					logger.info("✓ 网卡重置后网络已恢复。")
+					return True
+		elif adapter_reset:
+			logger.info("为遵守 Wi-Fi 参与恢复限制，跳过可能自动连接其他配置的网卡重置。")
+		if radio_blocked:
+			logger.error(
+				"无线被系统关闭、有线连接也不可用：请关闭飞行模式/打开 Wi-Fi 开关，"
+				"或以管理员身份运行（install_admin_task.bat）后重试。"
+			)
 		return False
 
 	logger.info("开始自动恢复，共有 %d 个候选配置，限定时间 %d 秒", len(candidates), reconnect_timeout)
@@ -794,9 +1003,7 @@ def recover_network(
 	logger.error("✗ 已尝试全部 %d 个候选 Wi-Fi 配置，网络仍未恢复。", len(candidates))
 
 	# 3) 最后手段：禁用再启用网卡，突破驱动层挂起（需管理员权限）
-	if adapter_reset and (enabled_profiles is not None or disabled_profiles):
-		logger.info("为遵守 Wi-Fi 参与恢复限制，跳过可能自动连接其他配置的网卡重置。")
-	if adapter_reset and enabled_profiles is None and not disabled_profiles:
+	if reset_permitted():
 		logger.info("所有候选配置均失败，尝试硬件重置 Wi-Fi 网卡…")
 		if repairs.reset_wifi_adapter(logger):
 			time.sleep(10)
@@ -804,6 +1011,14 @@ def recover_network(
 				logger.info("✓ 网卡重置后网络已恢复。")
 				return True
 			logger.warning("网卡已重置但网络仍未恢复。")
+	elif adapter_reset:
+		logger.info("为遵守 Wi-Fi 参与恢复限制，跳过可能自动连接其他配置的网卡重置。")
+
+	if radio_blocked:
+		logger.error(
+			"无线被系统关闭、有线连接也不可用：请关闭飞行模式/打开 Wi-Fi 开关，"
+			"或以管理员身份运行（install_admin_task.bat）后重试。"
+		)
 	return False
 
 
@@ -813,6 +1028,8 @@ def output_startup_diagnostics(args: argparse.Namespace, logger: logging.Logger)
 	logger.info("Python 版本: %s", sys.version.split()[0])
 	logger.info("操作系统: %s %s", platform.system(), platform.release())
 	logger.info("处理器: %s", platform.processor() or "Unknown")
+	logger.info("运行权限: %s", "管理员" if repairs.has_admin_privileges() else "普通用户（无法禁用/启用网卡）")
+	logger.info("Wi-Fi 无线电: %s", _describe_radio_state(repairs.wifi_radio_state(logger)))
 	
 	logger.info("命令行参数:")
 	logger.info("  - 轮询间隔: %s 秒", args.interval)
@@ -849,6 +1066,7 @@ def output_startup_diagnostics(args: argparse.Namespace, logger: logging.Logger)
 	logger.info("  - 系统代理清理: %s", "启用（断网时关闭系统代理）" if args.cleanup_proxy else "禁用")
 	logger.info("  - DNS 故障修复: %s", "启用（清空缓存 + 网卡 DNS 回退 DHCP）" if args.repair_dns else "禁用")
 	logger.info("  - Wi-Fi 重连恢复: %s", "启用" if args.wifi_recovery else "禁用（有线环境）")
+	logger.info("  - 无线电恢复: %s", "启用（无线被关闭时自动打开）" if getattr(args, "radio_recovery", True) else "禁用")
 	logger.info("  - 失败后重置网卡: %s", "启用" if args.adapter_reset else "禁用")
 	logger.info("  - 阻止系统休眠: %s", "启用" if args.prevent_sleep else "禁用")
 	logger.info("  - 心跳间隔: %s 秒", args.heartbeat_interval)
@@ -880,7 +1098,8 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 	repairs.register_exit_handler(logger, pid_file, lambda: reason["value"])
 
 	last_online = None
-	recovery_stats = {"attempts": 0, "successes": 0, "failures": 0, "dns_repairs": 0, "proxy_cleanups": 0, "wired_repairs": 0}
+	recovery_stats = {"attempts": 0, "successes": 0, "failures": 0, "dns_repairs": 0,
+		"proxy_cleanups": 0, "wired_repairs": 0, "radio_repairs": 0, "radio_blocked": 0}
 	last_heartbeat = time.time()
 
 	while True:
@@ -926,13 +1145,16 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 					wired_reset=getattr(args, "wired_reset", False),
 					dns_reset_interfaces=getattr(args, "dns_reset_interfaces", []),
 					repair_stats=recovery_stats,
+					radio_recovery=getattr(args, "radio_recovery", True),
 				)
 				
 				if recovered:
 					recovery_stats["successes"] += 1
 					success_rate = 100 * recovery_stats["successes"] / recovery_stats["attempts"]
 					logger.info("恢复成功率统计: %d/%d (%.1f%%)", recovery_stats["successes"], recovery_stats["attempts"], success_rate)
-					logger.info("分项统计：DNS 修复 %d 次，代理清理后恢复 %d 次，有线修复后恢复 %d 次", recovery_stats["dns_repairs"], recovery_stats["proxy_cleanups"], recovery_stats.get("wired_repairs", 0))
+					logger.info("分项统计：DNS 修复 %d 次，代理清理后恢复 %d 次，有线修复后恢复 %d 次，无线电恢复 %d 次",
+						recovery_stats["dns_repairs"], recovery_stats["proxy_cleanups"],
+						recovery_stats.get("wired_repairs", 0), recovery_stats.get("radio_repairs", 0))
 				else:
 					recovery_stats["failures"] += 1
 					failure_rate = 100 * recovery_stats["failures"] / recovery_stats["attempts"]
@@ -1002,6 +1224,7 @@ def main() -> None:
 	repair_dns = not getattr(args, "no_repair_dns", False) and config_data.get("repair_dns_on_failure", True)
 	adapter_reset = not getattr(args, "no_reset_adapter", False) and config_data.get("adapter_reset_on_failure", True)
 	wifi_recovery = not getattr(args, "no_wifi_recovery", False) and (args.wifi_recovery or config_data.get("wifi_recovery", True))
+	radio_recovery = not getattr(args, "no_radio_recovery", False) and config_data.get("wifi_radio_recovery", True)
 	wired_recovery = not getattr(args, "no_wired_recovery", False) and config_data.get("wired_recovery", True)
 	wired_reset = adapter_reset and config_data.get("wired_reset_on_failure", True)
 
@@ -1070,6 +1293,7 @@ def main() -> None:
 	args.repair_dns = repair_dns
 	args.adapter_reset = adapter_reset
 	args.wifi_recovery = wifi_recovery
+	args.radio_recovery = radio_recovery
 	
 	output_startup_diagnostics(args, logger)
 	

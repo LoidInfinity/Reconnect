@@ -28,6 +28,7 @@
   "wired_recovery": true,
   "wired_reset_on_failure": true,
   "wifi_recovery": true,
+  "wifi_radio_recovery": true,
   "adapter_reset_on_failure": true,
   "verbose": false
 }
