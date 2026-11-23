@@ -122,7 +122,10 @@ class WindowTests(unittest.TestCase):
                     for tab in app.notebook.tabs():
                         app.notebook.select(tab)
                         root.update()
+                        hidden_tabs = {str(item) for item in app.notebook.tabs() if str(item) != str(app.notebook.select())}
                         def check_widgets(widget):
+                            if str(widget) in hidden_tabs:
+                                return
                             if widget.winfo_ismapped() and isinstance(widget, (gui.ttk.Label, gui.ttk.Button, gui.ttk.Entry, gui.ttk.Checkbutton, tk.Label)):
                                 self.assertGreaterEqual(widget.winfo_height(), widget.winfo_reqheight(), str(widget))
                                 self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth(), str(widget))
@@ -136,9 +139,33 @@ class WindowTests(unittest.TestCase):
                         root.after_cancel(timer)
                     root.destroy()
 
+    def test_main_window_has_no_outer_scrollbar(self):
+        """回归：整页不再用 Canvas 包裹，不能出现主界面滚动条。
+
+        旧版把整页放进 Canvas，滚动条不显眼，用户会误以为看到的就是全部。
+        现在窗口按内容自适应，只有日志区保留自己的滚动条。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = tk.Tk()
+            root.tk.call("tk", "scaling", 1.333)
+            try:
+                with patch.object(gui.GuardApp, "refresh"):
+                    app = gui.GuardApp(root, Path(directory) / "config.json")
+                root.update()
+                self.assertFalse(hasattr(app, "content_canvas"))
+                direct_scrollbars = [w for w in root.winfo_children() if isinstance(w, gui.ttk.Scrollbar)]
+                self.assertEqual(direct_scrollbars, [])
+                self.assertLessEqual(app.body.winfo_reqheight(), root.winfo_height())
+                self.assertLessEqual(app.sidebar_width + app.body.winfo_reqwidth(), root.winfo_width())
+            finally:
+                for timer in root.tk.call("after", "info"):
+                    root.after_cancel(timer)
+                root.destroy()
+
     def test_window_settings_events_and_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             root = tk.Tk()
+            root.tk.call("tk", "scaling", 1.333)
             try:
                 with patch.object(gui.GuardApp, "refresh"):
                     app = gui.GuardApp(root, Path(directory) / "config.json")
@@ -169,13 +196,11 @@ class WindowTests(unittest.TestCase):
                 app.poll()
                 self.assertIn("网络可用", app.status.cget("text"))
                 self.assertIn("1 / 2", app.stats.cget("text"))
-                # Check all tabs at the minimum supported window size.
+                # 窗口不再整页滚动：最小尺寸下底部提示也必须完整可见
                 root.geometry("900x700")
                 notebook = app.notebook
                 for tab in notebook.tabs():
                     notebook.select(tab)
-                    root.update()
-                    app.content_canvas.yview_moveto(1)
                     root.update()
                     self.assertLessEqual(app.notice.winfo_rooty() + app.notice.winfo_height(), root.winfo_rooty() + root.winfo_height())
                     self.assertEqual(app.notice.winfo_height(), app.notice.winfo_reqheight())

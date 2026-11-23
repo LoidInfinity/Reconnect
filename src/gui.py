@@ -256,16 +256,76 @@ class GuardApp:
             self.config = read_settings(BASE / "__unused_defaults__.json")
         root.title(f"Network Guard · 网络守护 {VERSION}")
         apply_window_icon(root)
-        root.geometry("1080x780")
-        root.minsize(900, 700)
+        root.geometry("1040x760")
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.build_ui()
         self.load_fields()
+        self.fit_window()
+        # 首次映射后内容宽度才确定，此时再校正一次窗口尺寸，
+        # 避免初始测量偏小导致底部被裁掉。
+        def fit_after_map(event=None):
+            if event is not None and event.widget is not self.root:
+                return
+            try:
+                self.root.unbind("<Map>", self._map_binding)
+            except Exception:  # noqa: BLE001
+                pass
+            self.fit_window()
+
+        self._map_binding = self.root.bind("<Map>", fit_after_map, add="+")
         self.root.after(100, self.poll)
         if self.config_error:
             self.root.after(200, lambda: messagebox.showwarning("配置读取失败", self.config_error + "\n已载入默认值；保存将覆盖原配置。"))
         self.refresh()
+
+    def _scrollable_tab(self, notebook, title, padding=12):
+        """Add a tab whose body only scrolls when it really does not fit.
+
+        The main window itself never scrolls; this keeps the long settings form
+        (and the Wi-Fi list on small screens) usable without the easy-to-miss
+        page-level scrollbar that used to hide content.
+        """
+        outer = ttk.Frame(notebook)
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(canvas, padding=padding)
+        window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def sync(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            width = canvas.winfo_width()
+            if width <= 50:
+                # Hidden tab: lay the form out at a realistic width so the
+                # window can still be sized from its requested height.
+                width = max(content.winfo_reqwidth(), int(canvas.cget("width")))
+            canvas.itemconfigure(window, width=width)
+            wanted = content.winfo_reqheight()
+            if int(canvas.cget("height")) != wanted:
+                canvas.configure(height=wanted)
+            height = canvas.winfo_height()
+            overflow = height > 50 and content.winfo_reqheight() > height
+            if overflow and not bar.winfo_ismapped():
+                bar.pack(side="right", fill="y", before=canvas)
+            elif not overflow and bar.winfo_ismapped():
+                bar.pack_forget()
+
+        def on_wheel(event):
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+
+        def bind_wheel(widget):
+            widget.bind("<MouseWheel>", on_wheel)
+            for child in widget.winfo_children():
+                bind_wheel(child)
+
+        content.bind("<Configure>", sync)
+        canvas.bind("<Configure>", sync)
+        notebook.add(outer, text=title)
+        self.root.after_idle(sync)
+        return content, bind_wheel, canvas
 
     def build_ui(self):
         style = ttk.Style()
@@ -282,6 +342,7 @@ class GuardApp:
         style.configure("Treeview", rowheight=line_height + 16, font=("Microsoft YaHei UI", 10))
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"))
         sidebar_width = tkfont.Font(family="Microsoft YaHei UI", size=18, weight="bold").measure("◉  CONNECT") + 48
+        self.sidebar_width = sidebar_width
         sidebar = tk.Frame(self.root, bg="#11233f", width=sidebar_width)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
@@ -297,69 +358,61 @@ class GuardApp:
         self.support_button.pack(side="bottom", padx=20, pady=(2, 8), anchor="w")
         tk.Label(sidebar, text=f"v{VERSION}", bg="#11233f", fg="#9eb2d0",
                  font=("Microsoft YaHei UI", 10)).pack(side="bottom", padx=20, anchor="w")
-        # A scrollable content area preserves full widget heights at high DPI
-        # and in small windows instead of letting pack clip the bottom controls.
-        viewport = ttk.Frame(self.root)
-        viewport.pack(side="left", fill="both", expand=True)
-        self.content_canvas = tk.Canvas(viewport, bg=BG, highlightthickness=0)
-        content_scroll = ttk.Scrollbar(viewport, orient="vertical", command=self.content_canvas.yview)
-        content_scroll.pack(side="right", fill="y")
-        content_x = ttk.Scrollbar(viewport, orient="horizontal", command=self.content_canvas.xview)
-        content_x.pack(side="bottom", fill="x")
-        self.content_canvas.pack(fill="both", expand=True)
-        self.content_canvas.configure(yscrollcommand=content_scroll.set, xscrollcommand=content_x.set)
-        body = ttk.Frame(self.content_canvas, padding=20)
-        body_window = self.content_canvas.create_window((0, 0), window=body, anchor="nw")
-        def resize_content(event=None):
-            width = max(self.content_canvas.winfo_width(),
-                        actions.winfo_reqwidth() + 40, settings.winfo_reqwidth() + 44)
-            self.content_canvas.itemconfigure(body_window, width=width)
-            self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
-        body.bind("<Configure>", resize_content)
-        self.content_canvas.bind("<Configure>", resize_content)
-        def scroll_content(event):
-            if not isinstance(event.widget, (tk.Text, ttk.Treeview)):
-                self.content_canvas.yview_scroll(-int(event.delta / 120), "units")
-        self.root.bind("<MouseWheel>", scroll_content, add="+")
-        headline = ttk.Label(body, text="让连接持续在线", font=("Microsoft YaHei UI", 23, "bold"))
+        # 主界面直接铺满窗口，不再用 Canvas 包住整页。
+        # 先前整页可滚动，但滚动条很不显眼，用户会误以为看到的就是全部内容；
+        # 现在按内容自适应窗口大小，只有日志区保留自己的滚动条。
+        body = ttk.Frame(self.root, padding=(18, 14))
+        body.pack(side="left", fill="both", expand=True)
+        self.body = body
+
+        header = ttk.Frame(body)
+        header.pack(fill="x")
+        header.columnconfigure(0, weight=1)
+        titles = ttk.Frame(header)
+        titles.grid(row=0, column=0, sticky="nsew")
+        headline = ttk.Label(titles, text="让连接持续在线", font=("Microsoft YaHei UI", 19, "bold"))
         headline.pack(anchor="w")
-        wrap_label(headline, body, 40)
-        subtitle = ttk.Label(body, text="检测网络状态，在断线时自动尝试已保存的 Wi-Fi。", foreground=MUTED)
-        subtitle.pack(anchor="w", pady=(8, 20))
-        wrap_label(subtitle, body, 40)
-        card = tk.Frame(body, bg="white", padx=20, pady=15)
-        card.pack(fill="x")
+        wrap_label(headline, titles, 24)
+        subtitle = ttk.Label(titles, text="检测网络状态，断线时自动恢复已保存的 Wi-Fi。", foreground=MUTED)
+        subtitle.pack(anchor="w", pady=(2, 0))
+        wrap_label(subtitle, titles, 24)
+
+        card = tk.Frame(header, bg="white", padx=16, pady=10)
+        card.grid(row=0, column=1, sticky="ne", padx=(16, 0))
         self.status = tk.Label(card, text="●  守护未启动", bg="white", fg=MUTED,
-                               font=("Microsoft YaHei UI", 18, "bold"))
+                               font=("Microsoft YaHei UI", 15, "bold"))
         self.status.pack(anchor="w")
-        self.network = tk.Label(card, text="正在读取网卡信息…", bg="white", fg=MUTED, font=("Microsoft YaHei UI", 10))
-        self.network.pack(anchor="w", pady=(10, 0))
-        self.stats = tk.Label(card, text="最近检测 —    |    本次恢复成功 0 / 0", bg="white", fg=MUTED, font=("Microsoft YaHei UI", 10))
-        self.stats.pack(anchor="w", pady=(6, 0))
-        for label in (self.status, self.network, self.stats):
-            wrap_label(label, card, 40)
+        self.network = tk.Label(card, text="正在读取网卡信息…", bg="white", fg=MUTED,
+                                font=("Microsoft YaHei UI", 10), justify="left", wraplength=330)
+        self.network.pack(anchor="w", pady=(6, 0))
+        self.stats = tk.Label(card, text="最近检测 —    |    本次恢复成功 0 / 0", bg="white", fg=MUTED,
+                              font=("Microsoft YaHei UI", 10), justify="left", wraplength=330)
+        self.stats.pack(anchor="w", pady=(4, 0))
         actions = ttk.Frame(body)
-        actions.pack(fill="x", pady=16)
+        actions.pack(fill="x", pady=(10, 8))
         self.start_button = ttk.Button(actions, text="▶  启动守护", style="Primary.TButton", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(actions, text="■  停止守护", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
         self.refresh_button = ttk.Button(actions, text="刷新 Wi-Fi", command=self.refresh)
         self.refresh_button.pack(side="right")
+        # 先占住底部提示条，窗口再矮也不会把「就绪」那行挤掉；
+        # 页签内部自行滚动，整页仍然不滚动。
+        self.notice = ttk.Label(body, text="就绪 · 点击启动后开始自动检测与恢复", foreground=MUTED)
+        self.notice.pack(side="bottom", anchor="w", pady=(8, 0))
+        wrap_label(self.notice, body, 24)
         notebook = self.notebook = ttk.Notebook(body)
         notebook.pack(fill="both", expand=True)
-        networks = ttk.Frame(notebook, padding=15)
-        settings = ttk.Frame(notebook, padding=15)
-        logs = ttk.Frame(notebook, padding=12)
-        notebook.add(networks, text="已保存的 Wi-Fi")
-        notebook.add(settings, text="守护设置")
+        networks, bind_networks_wheel, _ = self._scrollable_tab(notebook, "已保存的 Wi-Fi")
+        settings, bind_settings_wheel, settings_canvas = self._scrollable_tab(notebook, "守护设置")
+        logs = ttk.Frame(notebook, padding=10)
         notebook.add(logs, text="运行日志")
         hint = ttk.Label(networks, text="默认仅当前连接的 Wi-Fi 参与恢复。点击右侧开关或选中后按空格修改。", foreground=MUTED)
-        hint.pack(anchor="w", pady=(0, 12))
+        hint.pack(anchor="w", pady=(0, 8))
         wrap_label(hint, networks, 30)
         table = ttk.Frame(networks)
         table.pack(fill="both", expand=True)
-        self.profiles = ttk.Treeview(table, columns=("name", "priority", "enabled"), show="headings", selectmode="browse", height=6)
+        self.profiles = ttk.Treeview(table, columns=("name", "priority", "enabled"), show="headings", selectmode="browse", height=5)
         self.profiles.heading("name", text="Wi-Fi 配置名称")
         self.profiles.heading("priority", text="优先顺序")
         self.profiles.heading("enabled", text="参与恢复（点击切换）")
@@ -375,33 +428,36 @@ class GuardApp:
         self.profiles.pack(fill="both", expand=True)
         self.profiles.bind("<Button-1>", self.toggle_clicked)
         self.profiles.bind("<space>", self.toggle_selected)
-        ttk.Button(networks, text="将所选 Wi-Fi 设为首选", command=self.prefer).pack(anchor="w", pady=10)
+        ttk.Button(networks, text="将所选 Wi-Fi 设为首选", command=self.prefer).pack(anchor="w", pady=8)
         self.profile_hint = ttk.Label(networks, text="正在读取…", foreground=MUTED)
         self.profile_hint.pack(anchor="w")
         wrap_label(self.profile_hint, networks, 30)
         recovery_hint = ttk.Label(networks, text="开关自动保存，从下一轮恢复生效。关闭的 Wi-Fi 即使是首选或上次成功连接，也会跳过。", foreground=MUTED)
-        recovery_hint.pack(anchor="w", pady=(8, 0))
+        recovery_hint.pack(anchor="w", pady=(6, 0))
         wrap_label(recovery_hint, networks, 30)
+        bind_networks_wheel(networks)
         settings.columnconfigure(1, weight=1)
         self.fields = {}
         for row, (key, label) in enumerate((("interval", "检测间隔（秒）"), ("reconnect_timeout", "重连超时（秒）"), ("interface", "网卡名称（留空自动）"))):
-            ttk.Label(settings, text=label).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=5)
+            ttk.Label(settings, text=label).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=3)
             var = tk.StringVar()
             self.fields[key] = var
-            ttk.Entry(settings, textvariable=var, font=("Microsoft YaHei UI", 10), width=16).grid(row=row, column=1, sticky="ew", pady=5)
+            ttk.Entry(settings, textvariable=var, font=("Microsoft YaHei UI", 10), width=16).grid(row=row, column=1, sticky="ew", pady=3)
         for row, key, label in [(3, "preferred_profiles", "首选配置（每行一个）"), (4, "check_targets", "检测地址（每行一个）")]:
-            ttk.Label(settings, text=label).grid(row=row, column=0, sticky="nw", pady=5)
-            widget = tk.Text(settings, height=3, width=24, font=("Microsoft YaHei UI", 10), relief="solid", bd=1)
-            widget.grid(row=row, column=1, sticky="ew", pady=5)
+            ttk.Label(settings, text=label).grid(row=row, column=0, sticky="nw", pady=3)
+            widget = tk.Text(settings, height=2, width=24, font=("Microsoft YaHei UI", 10), relief="solid", bd=1)
+            widget.grid(row=row, column=1, sticky="ew", pady=3)
             self.fields[key] = widget
         self.verbose = tk.BooleanVar()
         ttk.Checkbutton(settings, text="显示调试日志", variable=self.verbose).grid(row=5, column=1, sticky="w")
         recovery = ttk.Frame(settings)
-        recovery.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        recovery.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(recovery, text="断线自动修复（从轻到重依次尝试）",
-                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+                  font=("Microsoft YaHei UI", 10, "bold")).grid(
+                      row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
         self.switches = {}
-        for key, text in (
+        switch_widgets = []
+        for index, (key, text) in enumerate((
             ("cleanup_proxy_on_disconnect", "清理系统代理（代理工具失效导致的应用层断网）"),
             ("repair_dns_on_failure", "修复 DNS（清空缓存 + 网卡 DNS 回退自动获取）"),
             ("wired_recovery", "先修复有线连接（DHCP 续约，解决拿不到 IP 地址）"),
@@ -409,11 +465,39 @@ class GuardApp:
             ("wifi_radio_recovery", "无线被关闭时自动打开无线电（飞行模式/Wi-Fi 开关被关）"),
             ("adapter_reset_on_failure", "全部失败后禁用/启用网卡（需管理员权限）"),
             ("prevent_sleep", "守护期间阻止系统休眠"),
-        ):
+        )):
             var = tk.BooleanVar()
             self.switches[key] = var
-            ttk.Checkbutton(recovery, text=text, variable=var).pack(anchor="w")
-        ttk.Button(settings, text="保存设置", command=self.save).grid(row=7, column=1, sticky="e", pady=8)
+            row, column = divmod(index, 2)
+            widget = ttk.Checkbutton(recovery, text=text, variable=var)
+            widget.grid(row=1 + row, column=column, sticky="w", padx=(0, 18), pady=1)
+            switch_widgets.append(widget)
+        recovery.columnconfigure(0, weight=1)
+        recovery.columnconfigure(1, weight=1)
+        # 两列布局所需宽度；窗口太窄时自动退回单列，避免文字被横向裁掉
+        widest = max((widget.winfo_reqwidth() for widget in switch_widgets), default=0)
+        if widest:
+            settings_canvas.configure(width=widest * 2 + 56)
+        switch_columns = [2]
+
+        def layout_switches(width):
+            columns = 2 if widest and width >= widest * 2 + 56 else 1
+            if columns == switch_columns[0]:
+                return
+            switch_columns[0] = columns
+            for index, widget in enumerate(switch_widgets):
+                row, column = divmod(index, columns)
+                widget.grid_configure(row=1 + row, column=column)
+            recovery.columnconfigure(1, weight=2 if columns == 2 else 0)
+
+        def relayout_switches(event=None):
+            width = settings_canvas.winfo_width()
+            if width > 50:
+                layout_switches(width)
+
+        settings_canvas.bind("<Configure>", relayout_switches, add="+")
+        ttk.Button(settings, text="保存设置", command=self.save).grid(row=7, column=1, sticky="e", pady=6)
+        bind_settings_wheel(settings)
         toolbar = ttk.Frame(logs)
         toolbar.pack(fill="x", pady=(0, 8))
         ttk.Label(toolbar, text="实时输出 · 最多显示 1500 行", foreground=MUTED).pack(side="left")
@@ -426,9 +510,26 @@ class GuardApp:
         self.log_text.pack(fill="both", expand=True)
         self.log_text.tag_configure("ERROR", foreground="#fda4af")
         self.log_text.tag_configure("WARNING", foreground="#fcd34d")
-        self.notice = ttk.Label(body, text="就绪 · 点击启动后开始自动检测与恢复", foreground=MUTED)
-        self.notice.pack(anchor="w", pady=(12, 0))
-        wrap_label(self.notice, body, 40)
+
+    def fit_window(self):
+        """Size the window to its content; never shrink below it.
+
+        The old design wrapped the whole page in a Canvas whose scrollbars were
+        easy to miss, so users assumed the visible part was everything. The
+        window now grows to fit the content, and only the log view keeps an
+        internal scrollbar.
+        """
+        self.root.update_idletasks()
+        needed_width = self.sidebar_width + self.body.winfo_reqwidth()
+        needed_height = self.body.winfo_reqheight() + 8
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        max_width = max(880, screen_width - 40)
+        max_height = max(640, screen_height - 80)
+        width = min(max(needed_width, 1040), max_width)
+        height = min(max(needed_height, 720), max_height)
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(min(needed_width, max_width), min(needed_height, max_height))
 
     def load_fields(self):
         for key, widget in self.fields.items():
