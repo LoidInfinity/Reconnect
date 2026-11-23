@@ -99,30 +99,50 @@ class WorkerTests(unittest.TestCase):
 
 
 class HideProfilesTests(unittest.TestCase):
-    """「从列表移除」只改软件展示，不动 Windows 里保存的 Wi-Fi 配置。"""
+    """隐藏名单、优先序号与排序逻辑（无需真实 Tk 窗口）。"""
 
     class _Profiles:
-        def __init__(self, names):
-            self._names = list(names)
+        def __init__(self, rows):
+            self._rows = [list(row) for row in rows]
+            self.headings = {}
 
         def get_children(self):
-            return list(range(len(self._names)))
+            return list(range(len(self._rows)))
 
-        def item(self, index, option=None):
-            return (self._names[index], "—", "☐ 不使用")
+        def item(self, index, option=None, values=None):
+            if values is not None:
+                self._rows[index] = list(values)
+                return None
+            return tuple(self._rows[index])
 
         def delete(self, *items):
             for index in sorted(items, reverse=True):
-                del self._names[index]
+                del self._rows[index]
+
+        def insert(self, parent, position, values):
+            self._rows.append(list(values))
+
+        def heading(self, column, text=None):
+            self.headings[column] = text
 
         def names(self):
-            return list(self._names)
+            return [row[0] for row in self._rows]
+
+        def priorities(self):
+            return [row[1] for row in self._rows]
 
     class _App:
-        def __init__(self, path, config, names):
-            self.config_path = path
+        def __init__(self, directory, config, rows, hidden=()):
+            self.directory = Path(directory)
+            self.config_path = self.directory / "config.json"
             self.config = dict(config)
-            self.profiles = HideProfilesTests._Profiles(names)
+            self.profiles = HideProfilesTests._Profiles(rows)
+            self.hidden_file = self.directory / "hidden_wifi.txt"
+            self._profile_order = [row[0] for row in rows]
+            self._sort_column = None
+            self._sort_ascending = True
+            self._heading_labels = {"name": "Wi-Fi 配置名称", "priority": "优先顺序",
+                                    "enabled": "参与恢复（点击切换）"}
             self.notices = []
             self.refresh_count = 0
             self.root = None
@@ -133,6 +153,8 @@ class HideProfilesTests(unittest.TestCase):
             self.restore_button = SimpleNamespace(
                 configure=lambda **kwargs: self.restore_states.append(kwargs)
             )
+            if hidden:
+                gui.save_hidden_profiles(self.hidden_file, list(hidden))
 
         def refresh(self):
             self.refresh_count += 1
@@ -140,20 +162,43 @@ class HideProfilesTests(unittest.TestCase):
         def update_restore_button(self):
             gui.GuardApp.update_restore_button(self)
 
-    def _app(self, directory, config, names):
-        return self._App(Path(directory) / "config.json", config, names)
+        def update_priorities(self):
+            gui.GuardApp.update_priorities(self)
 
-    def test_hides_only_unchecked_profiles(self):
+        def priority_order(self):
+            return gui.GuardApp.priority_order(self)
+
+        def sort_by(self, column):
+            gui.GuardApp.sort_by(self, column)
+
+        def _apply_sort(self):
+            gui.GuardApp._apply_sort(self)
+
+        def _update_sort_arrows(self):
+            gui.GuardApp._update_sort_arrows(self)
+
+        def apply_list_order(self):
+            gui.GuardApp.apply_list_order(self)
+
+    def _app(self, directory, config, rows, hidden=()):
+        return self._App(directory, config, rows, hidden)
+
+    @staticmethod
+    def _rows(*names):
+        return [(name, "—", "☐ 不使用") for name in names]
+
+    def test_hides_only_unchecked_profiles_into_config_file(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self._app(directory, dict(enabled_profiles=["Home"], disabled_profiles=["Office"],
-                                           preferred_profiles=["Office"]), ["Home", "Office"])
+                                            preferred_profiles=["Office"]),
+                            self._rows("Home", "Office"))
             with patch.object(gui.messagebox, "askyesno", return_value=True) as ask, \
                  patch.object(gui.subprocess, "run") as run:
                 gui.GuardApp.hide_unselected(app)
             ask.assert_called_once()
             run.assert_not_called()  # 绝不执行 netsh 删除
+            self.assertEqual(gui.load_hidden_profiles(app.hidden_file), ["Office"])
             saved = gui.read_settings(app.config_path)
-            self.assertEqual(saved["hidden_profiles"], ["Office"])
             self.assertEqual(saved["disabled_profiles"], [])
             self.assertEqual(saved["preferred_profiles"], [])
             self.assertEqual(app.profiles.names(), ["Home"])
@@ -164,17 +209,17 @@ class HideProfilesTests(unittest.TestCase):
     def test_cancel_changes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self._app(directory, dict(enabled_profiles=["Home"], disabled_profiles=["Office"]),
-                            ["Home", "Office"])
+                            self._rows("Home", "Office"))
             with patch.object(gui.messagebox, "askyesno", return_value=False), \
                  patch.object(gui.subprocess, "run") as run:
                 gui.GuardApp.hide_unselected(app)
             run.assert_not_called()
             self.assertEqual(app.config["disabled_profiles"], ["Office"])
-            self.assertNotIn("hidden_profiles", app.config)
+            self.assertFalse(app.hidden_file.exists())
 
     def test_no_unchecked_profile_is_a_noop(self):
         with tempfile.TemporaryDirectory() as directory:
-            app = self._app(directory, dict(enabled_profiles=["Home"]), ["Home"])
+            app = self._app(directory, dict(enabled_profiles=["Home"]), self._rows("Home"))
             gui.GuardApp.hide_unselected(app)
             self.assertIn("没有未选定", app.notices[-1])
 
@@ -182,21 +227,54 @@ class HideProfilesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for enabled in (None, []):
                 with self.subTest(enabled=enabled):
-                    app = self._app(directory, dict(enabled_profiles=enabled), ["Home", "Office"])
+                    app = self._app(directory, dict(enabled_profiles=enabled),
+                                    self._rows("Home", "Office"))
                     gui.GuardApp.hide_unselected(app)
                     self.assertIn("请先勾选", app.notices[-1])
                     self.assertEqual(app.profiles.names(), ["Home", "Office"])
 
-    def test_restore_hidden_clears_the_list(self):
+    def test_restore_hidden_clears_the_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            app = self._app(directory, dict(enabled_profiles=["Home"], hidden_profiles=["Office", "Cafe"]),
-                            ["Home"])
+            app = self._app(directory, dict(enabled_profiles=["Home"]), self._rows("Home"),
+                            hidden=["Office", "Cafe"])
             gui.GuardApp.restore_hidden(app)
-            saved = gui.read_settings(app.config_path)
-            self.assertEqual(saved["hidden_profiles"], [])
+            self.assertEqual(gui.load_hidden_profiles(app.hidden_file), [])
             self.assertEqual(app.refresh_count, 1)
             self.assertEqual(app.restore_states[-1]["state"], "disabled")
 
+    def test_priority_column_numbers_every_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory, dict(enabled_profiles=["Home", "Office", "Cafe"],
+                                            preferred_profiles=["Office"]),
+                            self._rows("Home", "Office", "Cafe"))
+            app.update_priorities()
+            self.assertEqual(app.priority_order(), ["Office", "Home", "Cafe"])
+            self.assertEqual(app.profiles.priorities(), ["2", "1", "3"])
+
+    def test_sorting_headers_reorder_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory, dict(enabled_profiles=["Home", "Office", "Cafe"],
+                                            preferred_profiles=["Office"]),
+                            self._rows("Home", "Office", "Cafe"))
+            app.update_priorities()
+            app.sort_by("priority")
+            self.assertEqual(app.profiles.names(), ["Office", "Home", "Cafe"])
+            app.sort_by("priority")  # 再点一次反向
+            self.assertEqual(app.profiles.names(), ["Cafe", "Home", "Office"])
+            app.sort_by("name")
+            self.assertEqual(app.profiles.names(), ["Cafe", "Home", "Office"])
+            self.assertIn("↑", app.profiles.headings["name"])
+
+    def test_apply_list_order_persists_current_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory, dict(enabled_profiles=["Home", "Office", "Cafe"]),
+                            self._rows("Home", "Office", "Cafe"))
+            app.sort_by("name")
+            app.apply_list_order()
+            saved = gui.read_settings(app.config_path)
+            self.assertEqual(saved["preferred_profiles"], ["Cafe", "Home", "Office"])
+            self.assertEqual(app.profiles.priorities(), ["1", "2", "3"])
+            self.assertIn("已按当前列表顺序", app.notices[-1])
 
 class WindowTests(unittest.TestCase):
     def setUp(self):

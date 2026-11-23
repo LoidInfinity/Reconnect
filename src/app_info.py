@@ -63,6 +63,20 @@ def resource_path(relative: str) -> Path:
     return base / relative
 
 
+def hidden_profiles_path() -> Path:
+    """Where the GUI keeps Wi-Fi profiles hidden from its own list.
+
+    The file lives in ``config/`` next to the program and is gitignored: it
+    contains personal network names but is never read by Windows itself.
+    """
+    config_dir = APP_DIR / "config"
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return config_dir / "hidden_wifi.txt"
+    except OSError:
+        return DATA_DIR / "hidden_wifi.txt"
+
+
 def clear_internet_marks(directory: Path | None = None) -> int:
     """删除浏览器下载时附加的 Zone.Identifier 数据流。
 

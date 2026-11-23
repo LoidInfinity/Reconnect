@@ -55,3 +55,6 @@ desktop.ini
 /dist/
 *.spec
 tests.log
+
+# GUI 隐藏的 Wi-Fi 名单（含个人网络名，禁止提交）
+/config/hidden_wifi.txt

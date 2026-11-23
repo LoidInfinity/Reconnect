@@ -156,7 +156,6 @@ def save_default_config(config_file: Path) -> None:
 		"check_targets": list(DEFAULT_CHECK_TARGETS),
 		"preferred_profiles": [],
 		"disabled_profiles": [],
-		"hidden_profiles": [],
 		"interface": None,
 		"log_file": LOG_SUBPATH,
 		"log_max_bytes": 2 * 1024 * 1024,

@@ -21,7 +21,8 @@ from tkinter import font as tkfont
 from urllib.parse import urlparse
 
 import main as guard
-from app_info import VERSION, APP_DIR, FROZEN, worker_command, resource_path
+from app_info import (VERSION, APP_DIR, DATA_DIR, FROZEN, worker_command, resource_path,
+                     hidden_profiles_path)
 from updates import check_updates
 
 BASE = APP_DIR
@@ -46,10 +47,36 @@ def wheel_scrolls_container(widget) -> bool:
     return not isinstance(widget, (ttk.Treeview, tk.Text))
 
 
+def load_hidden_profiles(path: Path) -> list[str]:
+    """Read the GUI-only hidden list (one Wi-Fi name per line)."""
+    for candidate in (path, DATA_DIR / "hidden_wifi.txt"):
+        try:
+            if candidate.is_file():
+                names = [line.strip() for line in candidate.read_text(encoding="utf-8").splitlines()]
+                return [name for name in names if name]
+        except OSError:
+            continue
+    return []
+
+
+def save_hidden_profiles(path: Path, names: list[str]) -> Path:
+    """Write the hidden list; fall back to the data dir if config/ is read-only."""
+    body = "\n".join(names)
+    error: OSError | None = None
+    for candidate in (path, DATA_DIR / "hidden_wifi.txt"):
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text(body + ("\n" if body else ""), encoding="utf-8")
+            return candidate
+        except OSError as exc:
+            error = exc
+    raise error if error else OSError("无法保存隐藏名单")
+
+
 def read_settings(path: Path) -> dict:
     defaults = dict(interval=10, reconnect_timeout=35,
                     check_targets=list(guard.DEFAULT_CHECK_TARGETS),
-                    preferred_profiles=[], disabled_profiles=[], hidden_profiles=[], enabled_profiles=None, interface=None, verbose=False,
+                    preferred_profiles=[], disabled_profiles=[], enabled_profiles=None, interface=None, verbose=False,
                     log_file=guard.LOG_SUBPATH,
                     state_file=guard.DEFAULT_STATE_FILE.name,
                     log_max_bytes=2097152, log_backup_count=5,
@@ -88,9 +115,8 @@ def validate_settings(data: dict) -> dict:
         if not isinstance(data.get(key, True), bool):
             raise ValueError(f"{key} 必须是 true 或 false")
         result[key] = data.get(key, True)
-    data = dict(data, disabled_profiles=data.get("disabled_profiles", []), dns_reset_interfaces=data.get("dns_reset_interfaces", []),
-                hidden_profiles=data.get("hidden_profiles", []))
-    for key in ("check_targets", "preferred_profiles", "disabled_profiles", "dns_check_hosts", "dns_reset_interfaces", "hidden_profiles"):
+    data = dict(data, disabled_profiles=data.get("disabled_profiles", []), dns_reset_interfaces=data.get("dns_reset_interfaces", []))
+    for key in ("check_targets", "preferred_profiles", "disabled_profiles", "dns_check_hosts", "dns_reset_interfaces"):
         if not isinstance(data[key], list) or any(not isinstance(x, str) for x in data[key]):
             raise ValueError(f"{key} 必须是字符串列表")
         result[key] = list(dict.fromkeys(x.strip() for x in data[key] if x.strip()))
@@ -260,6 +286,25 @@ class GuardApp:
         except (ValueError, OSError, TypeError, KeyError) as exc:
             self.config_error = str(exc)
             self.config = read_settings(BASE / "__unused_defaults__.json")
+        # 隐藏名单单独存在 config/hidden_wifi.txt（已被 .gitignore 排除），
+        # 不再写进主配置；旧配置里的 hidden_profiles 自动迁移一次。
+        self.hidden_file = hidden_profiles_path()
+        legacy_hidden = self.config.get("hidden_profiles") or []
+        if legacy_hidden:
+            merged = load_hidden_profiles(self.hidden_file)
+            seen = {name.casefold() for name in merged}
+            for name in legacy_hidden:
+                if name.casefold() not in seen:
+                    merged.append(name)
+                    seen.add(name.casefold())
+            try:
+                save_hidden_profiles(self.hidden_file, merged)
+            except OSError:
+                pass
+            self.config.pop("hidden_profiles", None)
+        self._profile_order: list[str] = []
+        self._sort_column: str | None = None
+        self._sort_ascending = True
         root.title(f"Network Guard · 网络守护 {VERSION}")
         apply_window_icon(root)
         root.geometry("1040x760")
@@ -432,9 +477,9 @@ class GuardApp:
         table = ttk.Frame(networks)
         table.pack(fill="both", expand=True)
         self.profiles = ttk.Treeview(table, columns=("name", "priority", "enabled"), show="headings", selectmode="browse", height=5)
-        self.profiles.heading("name", text="Wi-Fi 配置名称")
-        self.profiles.heading("priority", text="优先顺序")
-        self.profiles.heading("enabled", text="参与恢复（点击切换）")
+        self._heading_labels = {"name": "Wi-Fi 配置名称", "priority": "优先顺序", "enabled": "参与恢复（点击切换）"}
+        for column, label in self._heading_labels.items():
+            self.profiles.heading(column, text=label, command=lambda chosen=column: self.sort_by(chosen))
         measure = tkfont.Font(family="Microsoft YaHei UI", size=10, weight="bold").measure
         self.profiles.column("name", width=180, minwidth=100)
         self.profiles.column("priority", width=measure("优先顺序") + 24, minwidth=70, stretch=False, anchor="center")
@@ -454,6 +499,8 @@ class GuardApp:
         self.delete_button.pack(side="left", padx=8)
         self.restore_button = ttk.Button(network_actions, text="恢复已隐藏", command=self.restore_hidden, state="disabled")
         self.restore_button.pack(side="left")
+        self.apply_order_button = ttk.Button(network_actions, text="按当前顺序设为优先", command=self.apply_list_order)
+        self.apply_order_button.pack(side="left", padx=8)
         self.update_restore_button()
         self.profile_hint = ttk.Label(networks, text="正在读取…", foreground=MUTED)
         self.profile_hint.pack(anchor="w")
@@ -626,7 +673,7 @@ class GuardApp:
         ):
             return
 
-        hidden = list(self.config.get("hidden_profiles", []))
+        hidden = load_hidden_profiles(self.hidden_file)
         existing = {name.casefold() for name in hidden}
         for name in targets:
             if name.casefold() not in existing:
@@ -635,54 +682,119 @@ class GuardApp:
         target_keys = {name.casefold() for name in targets}
         data = dict(
             self.config,
-            hidden_profiles=hidden,
             preferred_profiles=[name for name in self.config.get("preferred_profiles", [])
                                 if name.casefold() not in target_keys],
             disabled_profiles=[name for name in self.config.get("disabled_profiles", [])
                                if name.casefold() not in target_keys],
         )
         try:
+            save_hidden_profiles(self.hidden_file, hidden)
             save_settings(self.config_path, data)
         except OSError as exc:
             self.notice.configure(text="移除失败，无法保存设置：" + str(exc))
             return
         self.config = data
+        self._profile_order = [name for name in self._profile_order if name.casefold() not in target_keys]
         for item in self.profiles.get_children():
             if self.profiles.item(item, "values")[0].casefold() in target_keys:
                 self.profiles.delete(item)
+        self.update_priorities()
         self.update_restore_button()
         self.notice.configure(text=f"已从列表移除 {len(targets)} 个未选定的 Wi-Fi（Windows 中仍保留）")
 
     def restore_hidden(self):
-        hidden = list(self.config.get("hidden_profiles", []))
+        hidden = load_hidden_profiles(self.hidden_file)
         if not hidden:
             return
-        data = dict(self.config, hidden_profiles=[])
         try:
-            save_settings(self.config_path, data)
+            save_hidden_profiles(self.hidden_file, [])
         except OSError as exc:
-            self.notice.configure(text="恢复失败，无法保存设置：" + str(exc))
+            self.notice.configure(text="恢复失败，无法保存隐藏名单：" + str(exc))
             return
-        self.config = data
         self.update_restore_button()
         self.notice.configure(text=f"已恢复 {len(hidden)} 个隐藏的 Wi-Fi，正在刷新列表…")
         self.refresh()
 
     def update_restore_button(self):
-        hidden = self.config.get("hidden_profiles", [])
+        hidden = load_hidden_profiles(self.hidden_file)
         if hidden:
             self.restore_button.configure(text=f"恢复已隐藏（{len(hidden)}）", state="normal")
         else:
             self.restore_button.configure(text="恢复已隐藏", state="disabled")
 
+    def priority_order(self) -> list[str]:
+        """Effective recovery order: preferred first, then the saved order."""
+        names = self._profile_order or [
+            self.profiles.item(item, "values")[0] for item in self.profiles.get_children()
+        ]
+        known = {name.casefold(): name for name in names}
+        preferred = [name for name in self.config.get("preferred_profiles", [])
+                     if name.casefold() in known]
+        preferred_keys = {name.casefold() for name in preferred}
+        return preferred + [name for name in names if name.casefold() not in preferred_keys]
+
     def update_priorities(self):
-        preferred = [x.casefold() for x in self.config["preferred_profiles"]]
-        disabled = {x.casefold() for x in self.config["disabled_profiles"]}
-        enabled = {x.casefold() for x in (self.config["enabled_profiles"] or [])}
+        disabled = {x.casefold() for x in self.config.get("disabled_profiles", [])}
+        enabled = {x.casefold() for x in (self.config.get("enabled_profiles") or [])}
+        rank = {name.casefold(): index + 1 for index, name in enumerate(self.priority_order())}
         for item in self.profiles.get_children():
             name = self.profiles.item(item, "values")[0]
-            priority = str(preferred.index(name.casefold()) + 1) if name.casefold() in preferred else "—"
-            self.profiles.item(item, values=(name, priority, "☑ 使用" if name.casefold() in enabled and name.casefold() not in disabled else "☐ 不使用"))
+            priority = rank.get(name.casefold())
+            self.profiles.item(item, values=(
+                name,
+                str(priority) if priority else "—",
+                "☑ 使用" if name.casefold() in enabled and name.casefold() not in disabled else "☐ 不使用",
+            ))
+
+    def sort_by(self, column: str):
+        """Sort the list by a column; clicking the same header flips direction."""
+        if self._sort_column == column:
+            self._sort_ascending = not self._sort_ascending
+        else:
+            self._sort_column = column
+            self._sort_ascending = True
+        self._apply_sort()
+
+    def _apply_sort(self):
+        if not self._sort_column:
+            return
+        rows = [list(self.profiles.item(item, "values")) for item in self.profiles.get_children()]
+        if self._sort_column == "priority":
+            def key(row):
+                return int(row[1]) if str(row[1]).isdigit() else 10 ** 6
+        elif self._sort_column == "enabled":
+            def key(row):
+                return 0 if str(row[2]).startswith("☑") else 1
+        else:
+            def key(row):
+                return str(row[0]).casefold()
+        rows.sort(key=key, reverse=not self._sort_ascending)
+        self.profiles.delete(*self.profiles.get_children())
+        for row in rows:
+            self.profiles.insert("", "end", values=row)
+        self._update_sort_arrows()
+
+    def _update_sort_arrows(self):
+        for column, label in self._heading_labels.items():
+            if column == self._sort_column:
+                label += " ↑" if self._sort_ascending else " ↓"
+            self.profiles.heading(column, text=label)
+
+    def apply_list_order(self):
+        """Persist the current (possibly sorted) row order as priority order."""
+        order = [self.profiles.item(item, "values")[0] for item in self.profiles.get_children()]
+        if not order:
+            self.notice.configure(text="列表为空，无法设置优先顺序")
+            return
+        data = dict(self.config, preferred_profiles=order)
+        try:
+            save_settings(self.config_path, data)
+        except OSError as exc:
+            self.notice.configure(text="保存优先顺序失败：" + str(exc))
+            return
+        self.config = data
+        self.update_priorities()
+        self.notice.configure(text=f"已按当前列表顺序更新优先顺序（共 {len(order)} 个）")
 
     def toggle_clicked(self, event):
         item = self.profiles.identify_row(event.y)
@@ -878,8 +990,9 @@ class GuardApp:
                 if kind == "inventory_error":
                     self.profile_hint.configure(text="读取失败：" + event["text"])
                 else:
-                    hidden = {name.casefold() for name in self.config.get("hidden_profiles", [])}
+                    hidden = {name.casefold() for name in load_hidden_profiles(self.hidden_file)}
                     visible = [name for name in event["profiles"] if name.casefold() not in hidden]
+                    self._profile_order = list(visible)
                     if self.config["enabled_profiles"] is None:
                         enabled = initial_enabled_profiles(visible, event["interfaces"], self.config["disabled_profiles"])
                         data = dict(self.config, enabled_profiles=enabled)
@@ -897,6 +1010,7 @@ class GuardApp:
                     name_width = max([180] + [name_font.measure(name) + 24 for name in visible])
                     self.profiles.column("name", width=name_width, minwidth=name_width)
                     self.update_priorities()
+                    self._apply_sort()
                     if event["profiles"]:
                         hint = f"共 {len(visible)} 个已保存配置"
                         if len(visible) < len(event["profiles"]):
