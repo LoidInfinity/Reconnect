@@ -2,7 +2,7 @@
 
 Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重”自动修复有线和无线连接。
 
-当前版本 **0.1.0-rc.3** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md)
+当前版本 **0.1.0-rc.2** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md)
 
 ## 安装版（Setup.exe）
 
@@ -149,8 +149,8 @@ python src/build.py                                        # 目录 + ZIP + 安�
 改好 `src/app_info.py` 里的 `VERSION` 与 `CHANGELOG.md`，提交后打标签推送：
 
 ```powershell
-git tag -a v0.1.0-rc.3 -m "0.1.0-rc.3"
-git push origin v0.1.0-rc.3
+git tag -a v0.1.0-rc.2 -m "0.1.0-rc.2"
+git push origin v0.1.0-rc.2
 ```
 
 `.github/workflows/release.yml` 会在 **推送 `v*` 标签时自动**触发：跑测试、校验标签与版本一致、构建 ZIP 与安装包、生成 SHA-256，并创建 **预发行** Release（标签中含 `-beta`、`-alpha`、`-rc` 即判定为预发行）。标签必须与 `VERSION` 完全一致，否则工作流直接失败。程序内置的“检查 GitHub 更新”依赖这个 Release，只推送代码不算发布。
