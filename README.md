@@ -2,7 +2,18 @@
 
 Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重”自动修复有线和无线连接。
 
-当前版本 **0.1.0-rc.2** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md)
+当前版本 **0.1.0-rc.3** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md)
+
+## 安装版（Setup.exe）
+
+发布页除 ZIP 外还提供 `NetworkGuard-Setup-<版本>.exe`：
+
+- 安装界面可**自选安装目录**（默认 `%LOCALAPPDATA%\Programs\NetworkGuard`），按当前用户安装，不触发 UAC。
+- 安装完成后**自动清除下载标记（Mark of the Web）**，安装目录里的 `.exe` / `.bat` 不会再弹「无法验证发布者」。
+- 自动创建开始菜单快捷方式、可选桌面快捷方式与标准卸载项；卸载只删程序目录，`%LOCALAPPDATA%\NetworkGuard` 里的配置和日志保留。
+
+安装包由 GitHub Actions 在推送 `v*` 标签时自动构建，无需本地环境。
+
 
 ## 两种启动方式
 
@@ -106,7 +117,9 @@ src/
   repairs.py                         网络修复动作（DNS、代理、有线、Wi-Fi、网卡重置）
   updates.py                         检查 GitHub Release 更新
   app_info.py                        版本号与可写数据目录
-  build.py                           PyInstaller 打包脚本
+  build.py                           PyInstaller + Inno Setup 打包脚本
+  installer.iss                      安装包脚本（自选目录、安装时清除下载标记）
+  ChineseSimplified.isl              安装界面中文语言文件（Inno Setup 官方）
 tests/                               单元测试与版本一致性校验
 config/network_guard_config.example.json   配置模板（不含真实信息）
 docs/LEGACY_REVIEW.md                与初始脚本的对照
@@ -124,8 +137,10 @@ requirements-build.txt / CHANGELOG.md / LICENSE
 ```powershell
 python -m pip install -r requirements-build.txt
 python -m unittest discover -s tests -t . -p "test_*.py"   # 全部用例
-python src/build.py                                        # 生成 dist/ 目录 + ZIP + SHA-256
+python src/build.py                                        # 目录 + ZIP + 安装包（若装了 Inno Setup）
 ```
+
+`build.py` 会输出目录版、`NetworkGuard-*-windows-x64.zip` 和（检测到 `ISCC.exe` 时）`NetworkGuard-Setup-<版本>.exe`，三者都带 `.sha256`。安装包需要 Inno Setup 6；本机没有时脚本会跳过安装包，不影响其他产物。CI 上由工作流自动用 Chocolatey 安装。
 
 打包版无需安装 Python，解压后双击 `NetworkGuard.exe`，请保留同目录的 `_internal` 文件夹。
 
@@ -134,11 +149,11 @@ python src/build.py                                        # 生成 dist/ 目录
 改好 `src/app_info.py` 里的 `VERSION` 与 `CHANGELOG.md`，提交后打标签推送：
 
 ```powershell
-git tag -a v0.1.0-rc.2 -m "0.1.0-rc.2"
-git push origin v0.1.0-rc.2
+git tag -a v0.1.0-rc.3 -m "0.1.0-rc.3"
+git push origin v0.1.0-rc.3
 ```
 
-`.github/workflows/release.yml` 会自动在 Windows 上跑测试、构建 ZIP 与 SHA-256，并创建 **预发行** Release（标签中含 `-beta`、`-alpha`、`-rc` 即判定为预发行）。标签必须与 `VERSION` 完全一致，否则工作流直接失败。程序内置的“检查 GitHub 更新”依赖这个 Release，只推送代码不算发布。
+`.github/workflows/release.yml` 会在 **推送 `v*` 标签时自动**触发：跑测试、校验标签与版本一致、构建 ZIP 与安装包、生成 SHA-256，并创建 **预发行** Release（标签中含 `-beta`、`-alpha`、`-rc` 即判定为预发行）。标签必须与 `VERSION` 完全一致，否则工作流直接失败。程序内置的“检查 GitHub 更新”依赖这个 Release，只推送代码不算发布。
 
 ## 界面说明
 
@@ -184,7 +199,9 @@ git push origin v0.1.0-rc.2
 | 运行方式 | 数据目录（配置 / 状态 / PID） | 日志 |
 | --- | --- | --- |
 | 源码运行 | `data\` | `data\logs\` |
-| 打包运行 | `%LOCALAPPDATA%\NetworkGuard` | `%LOCALAPPDATA%\NetworkGuard\logs\` |
+| 打包运行（ZIP / 安装版） | `%LOCALAPPDATA%\NetworkGuard` | `%LOCALAPPDATA%\NetworkGuard\logs\` |
+
+安装版把程序装到所选目录（默认 `%LOCALAPPDATA%\Programs\NetworkGuard`），数据仍写到 `%LOCALAPPDATA%\NetworkGuard`，因此升级或重装不会丢配置与日志。
 
 相对路径以数据目录为基准，因此开机自启（工作目录往往是 `System32`）也不会写错位置。旧版本散落在项目根目录的文件会在首次启动时自动迁移到上述位置。
 

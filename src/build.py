@@ -12,6 +12,67 @@ SOURCE_DIR = Path(__file__).resolve().parent
 ROOT = SOURCE_DIR.parent
 
 
+def sha256_of(path: Path) -> str:
+    checksum = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
+def find_iscc() -> Path | None:
+    """Locate Inno Setup's command-line compiler.
+
+    GitHub Actions 的 windows-latest 自 2025 年起不再预装 Inno Setup，
+    工作流会用 Chocolatey 安装；本地可用源码或 per-user 安装。
+    """
+    candidates: list[Path] = []
+    env = os.environ.get("ISCC")
+    if env:
+        candidates.append(Path(env))
+    which = shutil.which("iscc") or shutil.which("ISCC")
+    if which:
+        candidates.append(Path(which))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "InnoSetup6" / "ISCC.exe")
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if base:
+            candidates.append(Path(base) / "Inno Setup 6" / "ISCC.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def build_installer(windows_version: tuple[int, ...]) -> Path | None:
+    """Compile the per-user Setup.exe (optional, needs Inno Setup)."""
+    iscc = find_iscc()
+    if iscc is None:
+        print("未找到 Inno Setup（ISCC.exe），跳过安装包构建。")
+        return None
+    setup = ROOT / "dist" / f"NetworkGuard-Setup-{VERSION}.exe"
+    completed = subprocess.run(
+        [
+            str(iscc),
+            f"/DMyAppVersion={VERSION}",
+            "/DMyWinVersion=" + ".".join(str(part) for part in windows_version),
+            f"/DSourceRoot={ROOT / 'dist' / 'NetworkGuard'}",
+            str(SOURCE_DIR / "installer.iss"),
+        ],
+        cwd=ROOT,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(f"安装包编译失败（ISCC 返回码 {completed.returncode}）")
+    if not setup.exists():
+        raise SystemExit(f"安装包未生成: {setup}")
+    setup.with_suffix(".exe.sha256").write_text(
+        f"{sha256_of(setup)}  {setup.name}\n", encoding="ascii"
+    )
+    print(setup)
+    return setup
+
+
 def main():
     if sys.platform != "win32":
         raise SystemExit("Build on Windows with a 64-bit Python installation.")
@@ -79,13 +140,11 @@ def main():
     )
     archive = Path(shutil.make_archive(str(ROOT / "dist" / f"NetworkGuard-{VERSION}-windows-x64"),
                                       "zip", ROOT / "dist", "NetworkGuard"))
-    with archive.open("rb") as stream:
-        checksum = hashlib.sha256()
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            checksum.update(chunk)
-        digest = checksum.hexdigest()
-    archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
+    archive.with_suffix(".zip.sha256").write_text(
+        f"{sha256_of(archive)}  {archive.name}\n", encoding="ascii"
+    )
     print(archive)
+    build_installer(windows_version)
 
 
 if __name__ == "__main__":

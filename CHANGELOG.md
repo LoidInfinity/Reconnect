@@ -1,5 +1,16 @@
 # 更新记录
 
+## 0.1.0-rc.3 — 2026-11-23
+
+**新增安装包（Setup.exe），由 GitHub Actions 在打标签时自动构建**
+
+- 新增 `src/installer.iss`（Inno Setup 6）：安装界面可选安装目录，默认 `%LOCALAPPDATA%\Programs\NetworkGuard`，按当前用户安装、不触发 UAC；安装完成后**自动清除下载标记（Mark of the Web）**，安装目录里的 `.exe`/`.bat` 不再弹「无法验证发布者」。
+- 安装包会创建开始菜单快捷方式与可选桌面快捷方式，并提供标准卸载项；卸载只删除程序目录，`%LOCALAPPDATA%\NetworkGuard` 下的配置与日志保留。
+- `src/build.py` 增加安装包步骤：检测到 Inno Setup（`ISCC.exe`）时自动编译 `NetworkGuard-Setup-<版本>.exe` 并生成 `.sha256`；未安装时跳过并提示，不影响原有目录版与 ZIP。
+- 发布工作流（`.github/workflows/release.yml`）在 `v*` 标签触发时安装 Inno Setup，构建目录版 ZIP 与安装包，并一并上传到 Release；原有的测试、版本一致性校验与 SHA-256 校验保持。
+- 中文安装界面使用 Inno Setup 官方 `ChineseSimplified.isl`（随仓库提供，便于离线构建）。
+- 本地已验证：静默安装到指定目录（999 个文件）、安装日志确认执行了 `Unblock-File`、真实注入的 `Zone.Identifier` 被清除、静默卸载后目录清理干净。
+
 ## 0.1.0-rc.2 — 2026-11-22
 
 **修复「Wi-Fi 被系统关闭后不再重连」**
