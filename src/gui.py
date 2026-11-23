@@ -49,7 +49,7 @@ def wheel_scrolls_container(widget) -> bool:
 def read_settings(path: Path) -> dict:
     defaults = dict(interval=10, reconnect_timeout=35,
                     check_targets=list(guard.DEFAULT_CHECK_TARGETS),
-                    preferred_profiles=[], disabled_profiles=[], enabled_profiles=None, interface=None, verbose=False,
+                    preferred_profiles=[], disabled_profiles=[], hidden_profiles=[], enabled_profiles=None, interface=None, verbose=False,
                     log_file=guard.LOG_SUBPATH,
                     state_file=guard.DEFAULT_STATE_FILE.name,
                     log_max_bytes=2097152, log_backup_count=5,
@@ -88,8 +88,9 @@ def validate_settings(data: dict) -> dict:
         if not isinstance(data.get(key, True), bool):
             raise ValueError(f"{key} 必须是 true 或 false")
         result[key] = data.get(key, True)
-    data = dict(data, disabled_profiles=data.get("disabled_profiles", []), dns_reset_interfaces=data.get("dns_reset_interfaces", []))
-    for key in ("check_targets", "preferred_profiles", "disabled_profiles", "dns_check_hosts", "dns_reset_interfaces"):
+    data = dict(data, disabled_profiles=data.get("disabled_profiles", []), dns_reset_interfaces=data.get("dns_reset_interfaces", []),
+                hidden_profiles=data.get("hidden_profiles", []))
+    for key in ("check_targets", "preferred_profiles", "disabled_profiles", "dns_check_hosts", "dns_reset_interfaces", "hidden_profiles"):
         if not isinstance(data[key], list) or any(not isinstance(x, str) for x in data[key]):
             raise ValueError(f"{key} 必须是字符串列表")
         result[key] = list(dict.fromkeys(x.strip() for x in data[key] if x.strip()))
@@ -449,8 +450,11 @@ class GuardApp:
         network_actions = ttk.Frame(networks)
         network_actions.pack(fill="x", pady=8)
         ttk.Button(network_actions, text="将所选 Wi-Fi 设为首选", command=self.prefer).pack(side="left")
-        self.delete_button = ttk.Button(network_actions, text="删除未选定的 Wi-Fi", command=self.delete_unselected)
+        self.delete_button = ttk.Button(network_actions, text="从列表移除未选定的", command=self.hide_unselected)
         self.delete_button.pack(side="left", padx=8)
+        self.restore_button = ttk.Button(network_actions, text="恢复已隐藏", command=self.restore_hidden, state="disabled")
+        self.restore_button.pack(side="left")
+        self.update_restore_button()
         self.profile_hint = ttk.Label(networks, text="正在读取…", foreground=MUTED)
         self.profile_hint.pack(anchor="w")
         wrap_label(self.profile_hint, networks, 30)
@@ -597,68 +601,79 @@ class GuardApp:
         widget.insert("1.0", "\n".join([name] + existing))
         self.save()
 
-    def delete_unselected(self):
-        """Delete Wi-Fi profiles that are not checked for recovery.
+    def hide_unselected(self):
+        """Remove unchecked networks from this app's list only.
 
-        ``netsh wlan delete profile`` removes the saved network (and its
-        password), so the list is shown in a confirmation dialog first.
+        Windows keeps the saved profile and its password; the name lands in
+        ``hidden_profiles`` so it stays hidden after a refresh and can be
+        brought back with the restore button.
         """
         enabled = {name.casefold() for name in (self.config.get("enabled_profiles") or [])}
         if not enabled:
-            # 一个都没勾选时，"未选定"就是全部配置；直接删会清空所有 Wi-Fi。
-            self.notice.configure(text="请先勾选要保留的 Wi-Fi，再删除未选定的配置")
+            self.notice.configure(text="请先勾选要保留的 Wi-Fi，再从列表移除其余项")
             return
         names = [self.profiles.item(item, "values")[0] for item in self.profiles.get_children()]
         targets = [name for name in names if name.casefold() not in enabled]
         if not targets:
-            self.notice.configure(text="没有未选定的 Wi-Fi 配置需要删除")
+            self.notice.configure(text="列表中没有未选定的 Wi-Fi")
             return
         preview = "、".join(targets[:6]) + ("…" if len(targets) > 6 else "")
         if not messagebox.askyesno(
-            "删除未选定的 Wi-Fi",
-            f"将从 Windows 删除以下 {len(targets)} 个未选定的 Wi-Fi 配置：\n\n{preview}\n\n"
-            "删除后需要重新输入密码才能再次连接。是否继续？",
+            "从列表移除未选定的 Wi-Fi",
+            f"将从本软件的列表中移除以下 {len(targets)} 个未选定的 Wi-Fi：\n\n{preview}\n\n"
+            "不会删除 Windows 中保存的配置，密码也不会丢失；之后可用「恢复已隐藏」找回。",
             parent=self.root,
         ):
             return
 
-        removed: list[str] = []
-        failed: list[str] = []
+        hidden = list(self.config.get("hidden_profiles", []))
+        existing = {name.casefold() for name in hidden}
         for name in targets:
-            try:
-                completed = subprocess.run(
-                    ["netsh", "wlan", "delete", "profile", f"name={name}"],
-                    capture_output=True,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except OSError:
-                failed.append(name)
-                continue
-            (removed if completed.returncode == 0 else failed).append(name)
+            if name.casefold() not in existing:
+                hidden.append(name)
+                existing.add(name.casefold())
+        target_keys = {name.casefold() for name in targets}
+        data = dict(
+            self.config,
+            hidden_profiles=hidden,
+            preferred_profiles=[name for name in self.config.get("preferred_profiles", [])
+                                if name.casefold() not in target_keys],
+            disabled_profiles=[name for name in self.config.get("disabled_profiles", [])
+                               if name.casefold() not in target_keys],
+        )
+        try:
+            save_settings(self.config_path, data)
+        except OSError as exc:
+            self.notice.configure(text="移除失败，无法保存设置：" + str(exc))
+            return
+        self.config = data
+        for item in self.profiles.get_children():
+            if self.profiles.item(item, "values")[0].casefold() in target_keys:
+                self.profiles.delete(item)
+        self.update_restore_button()
+        self.notice.configure(text=f"已从列表移除 {len(targets)} 个未选定的 Wi-Fi（Windows 中仍保留）")
 
-        if removed:
-            deleted = {name.casefold() for name in removed}
-            data = dict(self.config)
-            data["preferred_profiles"] = [
-                name for name in data.get("preferred_profiles", []) if name.casefold() not in deleted
-            ]
-            data["disabled_profiles"] = [
-                name for name in data.get("disabled_profiles", []) if name.casefold() not in deleted
-            ]
-            try:
-                save_settings(self.config_path, data)
-                self.config = data
-            except OSError as exc:
-                self.notice.configure(text=f"已删除 {len(removed)} 个，但保存配置失败：{exc}")
-                self.refresh()
-                return
+    def restore_hidden(self):
+        hidden = list(self.config.get("hidden_profiles", []))
+        if not hidden:
+            return
+        data = dict(self.config, hidden_profiles=[])
+        try:
+            save_settings(self.config_path, data)
+        except OSError as exc:
+            self.notice.configure(text="恢复失败，无法保存设置：" + str(exc))
+            return
+        self.config = data
+        self.update_restore_button()
+        self.notice.configure(text=f"已恢复 {len(hidden)} 个隐藏的 Wi-Fi，正在刷新列表…")
         self.refresh()
-        if failed:
-            self.notice.configure(
-                text=f"已删除 {len(removed)} 个；{len(failed)} 个失败（可能需要管理员权限）"
-            )
+
+    def update_restore_button(self):
+        hidden = self.config.get("hidden_profiles", [])
+        if hidden:
+            self.restore_button.configure(text=f"恢复已隐藏（{len(hidden)}）", state="normal")
         else:
-            self.notice.configure(text=f"已删除 {len(removed)} 个未选定的 Wi-Fi 配置")
+            self.restore_button.configure(text="恢复已隐藏", state="disabled")
 
     def update_priorities(self):
         preferred = [x.casefold() for x in self.config["preferred_profiles"]]
@@ -863,8 +878,10 @@ class GuardApp:
                 if kind == "inventory_error":
                     self.profile_hint.configure(text="读取失败：" + event["text"])
                 else:
+                    hidden = {name.casefold() for name in self.config.get("hidden_profiles", [])}
+                    visible = [name for name in event["profiles"] if name.casefold() not in hidden]
                     if self.config["enabled_profiles"] is None:
-                        enabled = initial_enabled_profiles(event["profiles"], event["interfaces"], self.config["disabled_profiles"])
+                        enabled = initial_enabled_profiles(visible, event["interfaces"], self.config["disabled_profiles"])
                         data = dict(self.config, enabled_profiles=enabled)
                         try:
                             if not self.config_error:
@@ -874,13 +891,20 @@ class GuardApp:
                             continue
                         self.config = data
                     self.profiles.delete(*self.profiles.get_children())
-                    for name in event["profiles"]:
+                    for name in visible:
                         self.profiles.insert("", "end", values=(name, "—"))
                     name_font = tkfont.Font(family="Microsoft YaHei UI", size=10)
-                    name_width = max([180] + [name_font.measure(name) + 24 for name in event["profiles"]])
+                    name_width = max([180] + [name_font.measure(name) + 24 for name in visible])
                     self.profiles.column("name", width=name_width, minwidth=name_width)
                     self.update_priorities()
-                    self.profile_hint.configure(text=f"共 {len(event['profiles'])} 个已保存配置" if event["profiles"] else "未读取到配置；请先在 Windows 中连接 Wi-Fi，并检查 WLAN 服务及权限。")
+                    if event["profiles"]:
+                        hint = f"共 {len(visible)} 个已保存配置"
+                        if len(visible) < len(event["profiles"]):
+                            hint += f"（已从列表隐藏 {len(event['profiles']) - len(visible)} 个）"
+                        self.profile_hint.configure(text=hint)
+                    else:
+                        self.profile_hint.configure(text="未读取到配置；请先在 Windows 中连接 Wi-Fi，并检查 WLAN 服务及权限。")
+                    self.update_restore_button()
                     self.show_interfaces(event["interfaces"])
             elif kind == "status" and not self.stopping:
                 self.set_status(event["text"], event["tone"])

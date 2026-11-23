@@ -98,8 +98,8 @@ class WorkerTests(unittest.TestCase):
                     logger.removeHandler(handler)
 
 
-class DeleteProfilesTests(unittest.TestCase):
-    """「删除未选定的 Wi-Fi」逻辑无需真实 Tk 窗口即可验证。"""
+class HideProfilesTests(unittest.TestCase):
+    """「从列表移除」只改软件展示，不动 Windows 里保存的 Wi-Fi 配置。"""
 
     class _Profiles:
         def __init__(self, names):
@@ -111,40 +111,55 @@ class DeleteProfilesTests(unittest.TestCase):
         def item(self, index, option=None):
             return (self._names[index], "—", "☐ 不使用")
 
+        def delete(self, *items):
+            for index in sorted(items, reverse=True):
+                del self._names[index]
+
+        def names(self):
+            return list(self._names)
+
     class _App:
         def __init__(self, path, config, names):
             self.config_path = path
             self.config = dict(config)
-            self.profiles = DeleteProfilesTests._Profiles(names)
+            self.profiles = HideProfilesTests._Profiles(names)
             self.notices = []
             self.refresh_count = 0
             self.root = None
+            self.restore_states = []
             self.notice = SimpleNamespace(
                 configure=lambda **kwargs: self.notices.append(kwargs.get("text", ""))
+            )
+            self.restore_button = SimpleNamespace(
+                configure=lambda **kwargs: self.restore_states.append(kwargs)
             )
 
         def refresh(self):
             self.refresh_count += 1
 
+        def update_restore_button(self):
+            gui.GuardApp.update_restore_button(self)
+
     def _app(self, directory, config, names):
         return self._App(Path(directory) / "config.json", config, names)
 
-    def test_removes_only_unchecked_profiles(self):
+    def test_hides_only_unchecked_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self._app(directory, dict(enabled_profiles=["Home"], disabled_profiles=["Office"],
                                            preferred_profiles=["Office"]), ["Home", "Office"])
             with patch.object(gui.messagebox, "askyesno", return_value=True) as ask, \
-                 patch.object(gui.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
-                gui.GuardApp.delete_unselected(app)
+                 patch.object(gui.subprocess, "run") as run:
+                gui.GuardApp.hide_unselected(app)
             ask.assert_called_once()
-            run.assert_called_once()
-            self.assertEqual(run.call_args[0][0],
-                             ["netsh", "wlan", "delete", "profile", "name=Office"])
+            run.assert_not_called()  # 绝不执行 netsh 删除
             saved = gui.read_settings(app.config_path)
+            self.assertEqual(saved["hidden_profiles"], ["Office"])
             self.assertEqual(saved["disabled_profiles"], [])
             self.assertEqual(saved["preferred_profiles"], [])
-            self.assertEqual(app.refresh_count, 1)
-            self.assertIn("已删除 1 个", app.notices[-1])
+            self.assertEqual(app.profiles.names(), ["Home"])
+            self.assertEqual(app.refresh_count, 0)
+            self.assertIn("Windows 中仍保留", app.notices[-1])
+            self.assertIn("恢复已隐藏（1）", app.restore_states[-1]["text"])
 
     def test_cancel_changes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -152,28 +167,35 @@ class DeleteProfilesTests(unittest.TestCase):
                             ["Home", "Office"])
             with patch.object(gui.messagebox, "askyesno", return_value=False), \
                  patch.object(gui.subprocess, "run") as run:
-                gui.GuardApp.delete_unselected(app)
+                gui.GuardApp.hide_unselected(app)
             run.assert_not_called()
-            self.assertEqual(app.refresh_count, 0)
             self.assertEqual(app.config["disabled_profiles"], ["Office"])
+            self.assertNotIn("hidden_profiles", app.config)
 
     def test_no_unchecked_profile_is_a_noop(self):
         with tempfile.TemporaryDirectory() as directory:
             app = self._app(directory, dict(enabled_profiles=["Home"]), ["Home"])
-            with patch.object(gui.subprocess, "run") as run:
-                gui.GuardApp.delete_unselected(app)
-            run.assert_not_called()
+            gui.GuardApp.hide_unselected(app)
             self.assertIn("没有未选定", app.notices[-1])
 
-    def test_empty_whitelist_refuses_to_delete_everything(self):
+    def test_empty_whitelist_refuses_to_hide_everything(self):
         with tempfile.TemporaryDirectory() as directory:
             for enabled in (None, []):
                 with self.subTest(enabled=enabled):
                     app = self._app(directory, dict(enabled_profiles=enabled), ["Home", "Office"])
-                    with patch.object(gui.subprocess, "run") as run:
-                        gui.GuardApp.delete_unselected(app)
-                    run.assert_not_called()
+                    gui.GuardApp.hide_unselected(app)
                     self.assertIn("请先勾选", app.notices[-1])
+                    self.assertEqual(app.profiles.names(), ["Home", "Office"])
+
+    def test_restore_hidden_clears_the_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory, dict(enabled_profiles=["Home"], hidden_profiles=["Office", "Cafe"]),
+                            ["Home"])
+            gui.GuardApp.restore_hidden(app)
+            saved = gui.read_settings(app.config_path)
+            self.assertEqual(saved["hidden_profiles"], [])
+            self.assertEqual(app.refresh_count, 1)
+            self.assertEqual(app.restore_states[-1]["state"], "disabled")
 
 
 class WindowTests(unittest.TestCase):
