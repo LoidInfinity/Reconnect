@@ -10,7 +10,7 @@ Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重
 
 - 安装界面可**自选安装目录**（默认 `%LOCALAPPDATA%\Programs\NetworkGuard`），按当前用户安装，不触发 UAC。
 - 安装完成后**自动清除下载标记（Mark of the Web）**，安装目录里的 `.exe` / `.bat` 不会再弹「无法验证发布者」。
-- 自动创建开始菜单快捷方式、可选桌面快捷方式与标准卸载项；卸载只删程序目录，`%LOCALAPPDATA%\NetworkGuard` 里的配置和日志保留。
+- 自动创建开始菜单快捷方式（**图形界面**与**命令行**两个入口）、可选桌面快捷方式与标准卸载项；卸载只删程序目录，`%LOCALAPPDATA%\NetworkGuard` 里的配置和日志保留。
 
 安装包由 GitHub Actions 在推送 `v*` 标签时自动构建，无需本地环境。
 
@@ -37,6 +37,8 @@ python src/main.py --verbose    # 控制台同时输出调试日志
 ```
 
 适合服务器、开机脚本或不想开窗口的场景，日志同样写入 `data\logs\network_guard.log`。
+
+打包/安装版同样提供命令行入口：双击 `start_cli.bat`（它调用 `NetworkGuardCLI.exe`，参数与源码版一致），或从开始菜单打开「Network Guard（命令行）」。
 
 两种方式共用同一把单实例锁，同一时间只能有一个守护在操作网络：重复启动 CLI 直接以返回码 2 退出，GUI 的“启动守护”会提示已有实例，重复双击 GUI 只保留一个窗口。
 
@@ -142,7 +144,7 @@ python src/build.py                                        # 目录 + ZIP + 安�
 
 `build.py` 会输出目录版、`NetworkGuard-*-windows-x64.zip` 和（检测到 `ISCC.exe` 时）`NetworkGuard-Setup-<版本>.exe`，三者都带 `.sha256`。安装包需要 Inno Setup 6；本机没有时脚本会跳过安装包，不影响其他产物。CI 上由工作流自动用 Chocolatey 安装。
 
-打包版无需安装 Python，解压后双击 `NetworkGuard.exe`，请保留同目录的 `_internal` 文件夹。
+打包版无需安装 Python。解压或安装后有两个入口：`NetworkGuard.exe`（图形界面）与 `start_cli.bat` / `NetworkGuardCLI.exe`（命令行模式），请保留同目录的 `_internal` 文件夹。
 
 ### 发布新版本
 

@@ -73,6 +73,70 @@ def build_installer(windows_version: tuple[int, ...]) -> Path | None:
     return setup
 
 
+def write_version_file(path: Path, exe_name: str, windows_version: tuple[int, ...]) -> None:
+    path.write_text(f'''VSVersionInfo(
+  ffi=FixedFileInfo(filevers={windows_version}, prodvers={windows_version},
+    mask=0x3f, flags=0x2, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[StringFileInfo([StringTable('040904B0', [
+    StringStruct('FileDescription', 'Network Guard'),
+    StringStruct('FileVersion', '{VERSION}'),
+    StringStruct('ProductName', 'Network Guard'),
+    StringStruct('ProductVersion', '{VERSION}'),
+    StringStruct('OriginalFilename', '{exe_name}')])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])])''', encoding="utf-8")
+
+
+CLI_LAUNCHER = """@echo off
+rem ============================================================
+rem  Network Guard - CLI (terminal) mode
+rem  Runs the monitor loop in this console window.
+rem  Press Ctrl+C to stop. Logs also go to the data directory.
+rem
+rem  Usage:
+rem    start_cli.bat
+rem    start_cli.bat --config other.json
+rem    start_cli.bat --verbose
+rem    start_cli.bat --no-wifi-recovery
+rem ============================================================
+cd /d "%~dp0"
+
+echo Network Guard (CLI mode). Press Ctrl+C to stop.
+echo.
+"%~dp0NetworkGuardCLI.exe" %*
+
+set "CODE=%errorlevel%"
+
+echo.
+echo [exit] NetworkGuardCLI.exe exited with code %CODE%
+pause
+"""
+
+
+def build_cli(build: Path, output: Path, build_env: dict[str, str],
+              windows_version: tuple[int, ...]) -> Path:
+    """Compile the console CLI entry next to the windowed GUI build.
+
+    The GUI is built with ``--windowed``, so the packaged app had no console
+    entry at all: ``start_cli.bat`` only worked in the source tree where
+    ``src/main.py`` exists. This second pass builds ``NetworkGuardCLI.exe``
+    (console subsystem) and drops ``start_cli.bat`` beside it.
+    """
+    version_file = build / "version_info_cli.txt"
+    write_version_file(version_file, "NetworkGuardCLI.exe", windows_version)
+    cli_dist = build / "cli-dist"
+    subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+        "--onefile", "--console", "--name", "NetworkGuardCLI",
+        "--version-file", str(version_file), "--distpath", str(cli_dist),
+        "--workpath", str(build / "pyinstaller-cli"), "--specpath", str(build),
+        "--paths", str(SOURCE_DIR), str(SOURCE_DIR / "main.py")],
+        cwd=ROOT, check=True, env=build_env)
+    target = output / "NetworkGuardCLI.exe"
+    shutil.copy2(cli_dist / "NetworkGuardCLI.exe", target)
+    with (output / "start_cli.bat").open("w", encoding="ascii", newline="\r\n") as handle:
+        handle.write(CLI_LAUNCHER)
+    return target
+
+
 def main():
     if sys.platform != "win32":
         raise SystemExit("Build on Windows with a 64-bit Python installation.")
@@ -82,16 +146,7 @@ def main():
     core, _, prerelease = VERSION.partition("-")
     revision = int(prerelease.rsplit(".", 1)[-1]) if prerelease else 0
     windows_version = tuple(int(part) for part in core.split(".")) + (revision,)
-    version_file.write_text(f'''VSVersionInfo(
-  ffi=FixedFileInfo(filevers={windows_version}, prodvers={windows_version},
-    mask=0x3f, flags=0x2, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
-  kids=[StringFileInfo([StringTable('040904B0', [
-    StringStruct('FileDescription', 'Network Guard'),
-    StringStruct('FileVersion', '{VERSION}'),
-    StringStruct('ProductName', 'Network Guard'),
-    StringStruct('ProductVersion', '{VERSION}'),
-    StringStruct('OriginalFilename', 'NetworkGuard.exe')])]),
-    VarFileInfo([VarStruct('Translation', [1033, 1200])])])''', encoding="utf-8")
+    write_version_file(version_file, "NetworkGuard.exe", windows_version)
     build_env = dict(os.environ, PYINSTALLER_CONFIG_DIR=str(build / "cache"))
     # Conda places Tcl/Tk and other runtime DLLs outside the Python DLL folder.
     conda_bin = Path(sys.prefix) / "Library" / "bin"
@@ -114,13 +169,20 @@ def main():
         shutil.copy2(ROOT / "CHANGELOG.md", output / "CHANGELOG.md")
     if (ROOT / "unblock.bat").exists():
         shutil.copy2(ROOT / "unblock.bat", output / "unblock.bat")
+    # 打包版同时提供 GUI 与控制台两个入口，CLI 缺失曾导致安装后无法命令行运行
+    cli_exe = build_cli(build, output, build_env, windows_version)
+    print(cli_exe)
     # 从网上下载的 ZIP 解压后，Windows 会给每个文件打上"来自 Internet"标记，
     # 双击 .bat 时提示"无法验证发布者"。.bat 无法代码签名，只能靠去掉标记。
     (output / "READ-ME-FIRST.txt").write_text(
-        "如果双击 start_gui.bat 时 Windows 提示\n"
+        "如果双击 NetworkGuard.exe 时 Windows 提示\n"
         "  \"无法验证发布者，此文件没有包含有效的数字签名以验证其发布者\"\n"
         "这是 Windows 对「从网上下载的文件」的安全提示，不是程序故障，也不是文件损坏。\n"
-        "（.bat 文件无法代码签名，所以这个提示只能靠去掉\"下载标记\"来消除。）\n"
+        "（.bat / 未签名 .exe 没有可校验的签名，只能靠去掉\"下载标记\"来消除。）\n"
+        "\n"
+        "本目录有两个入口：\n"
+        "  NetworkGuard.exe      图形界面\n"
+        "  start_cli.bat         命令行模式（NetworkGuardCLI.exe，日志同时写入数据目录）\n"
         "\n"
         "最快：双击本文件夹里的 unblock.bat，等它跑完即可。\n"
         "      它会清理本目录下所有文件的下载标记，之后不再提示。\n"
@@ -134,6 +196,7 @@ def main():
         "   全选本文件夹里的所有文件 -> 右键 -> 属性 -> 勾选「解除锁定」-> 确定\n"
         "\n"
         "补充：\n"
+        "- 从安装包（NetworkGuard-Setup-*.exe）安装时，安装程序已自动清除下载标记。\n"
         "- 程序首次启动后会自动清理一遍，所以就算跳过上面的步骤，第一次点「运行」之后也不再提示。\n"
         "- 计划任务开机自启（install_admin_task.bat）不经过资源管理器，本来就不会弹这个提示。\n",
         encoding="utf-8-sig",

@@ -67,6 +67,7 @@ Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\NetworkGuard.exe"
+Name: "{group}\{#MyAppName}（命令行）"; Filename: "{app}\start_cli.bat"; WorkingDir: "{app}"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\NetworkGuard.exe"; Tasks: desktopicon
 
