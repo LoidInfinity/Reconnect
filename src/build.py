@@ -126,6 +126,7 @@ def build_cli(build: Path, output: Path, build_env: dict[str, str],
     cli_dist = build / "cli-dist"
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--onefile", "--console", "--name", "NetworkGuardCLI",
+        "--icon", str(ROOT / "assets" / "NetworkGuardCLI.ico"),
         "--version-file", str(version_file), "--distpath", str(cli_dist),
         "--workpath", str(build / "pyinstaller-cli"), "--specpath", str(build),
         "--paths", str(SOURCE_DIR), str(SOURCE_DIR / "main.py")],
@@ -154,6 +155,8 @@ def main():
         build_env["PATH"] = str(conda_bin) + os.pathsep + build_env.get("PATH", "")
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--onedir", "--windowed", "--name", "NetworkGuard",
+        "--icon", str(ROOT / "assets" / "NetworkGuard.ico"),
+        "--add-data", f"{ROOT / 'assets' / 'NetworkGuard.ico'}{os.pathsep}assets",
         "--version-file", str(version_file), "--distpath", str(ROOT / "dist"),
         "--workpath", str(build / "pyinstaller"), "--specpath", str(build),
         "--paths", str(SOURCE_DIR), str(SOURCE_DIR / "gui.py")],

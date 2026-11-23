@@ -53,6 +53,16 @@ def worker_command(config_path: Path) -> list[str]:
     return prefix + ["--worker", "--config", str(config_path)]
 
 
+def resource_path(relative: str) -> Path:
+    """Locate a bundled resource in source runs and in PyInstaller builds.
+
+    PyInstaller unpacks ``--add-data`` files under ``sys._MEIPASS``; a source
+    checkout keeps them next to the repository root.
+    """
+    base = Path(getattr(sys, "_MEIPASS", str(APP_DIR)))
+    return base / relative
+
+
 def clear_internet_marks(directory: Path | None = None) -> int:
     """删除浏览器下载时附加的 Zone.Identifier 数据流。
 

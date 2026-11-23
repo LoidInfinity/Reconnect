@@ -37,6 +37,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\NetworkGuard.exe
+SetupIconFile=..\assets\NetworkGuard.ico
 OutputDir=..\dist
 OutputBaseFilename=NetworkGuard-Setup-{#MyAppVersion}
 Compression=lzma2/max
@@ -67,7 +68,7 @@ Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\NetworkGuard.exe"
-Name: "{group}\{#MyAppName}（命令行）"; Filename: "{app}\start_cli.bat"; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName}（命令行）"; Filename: "{app}\start_cli.bat"; WorkingDir: "{app}"; IconFilename: "{app}\NetworkGuardCLI.exe"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\NetworkGuard.exe"; Tasks: desktopicon
 

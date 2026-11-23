@@ -21,7 +21,7 @@ from tkinter import font as tkfont
 from urllib.parse import urlparse
 
 import main as guard
-from app_info import VERSION, APP_DIR, FROZEN, worker_command
+from app_info import VERSION, APP_DIR, FROZEN, worker_command, resource_path
 from updates import check_updates
 
 BASE = APP_DIR
@@ -228,6 +228,16 @@ def _monitor_worker(config_path, config, logger):
             logger.info("系统休眠恢复，立即重新检测网络。")
 
 
+def apply_window_icon(window) -> None:
+    """Use the bundled Q-version icon for the window and taskbar."""
+    try:
+        icon = resource_path("assets/NetworkGuard.ico")
+        if icon.is_file():
+            window.iconbitmap(default=str(icon))
+    except Exception:  # noqa: BLE001 - a missing icon must never block startup
+        pass
+
+
 class GuardApp:
     def __init__(self, root: tk.Tk, config_path: Path):
         self.root, self.config_path = root, config_path
@@ -245,6 +255,7 @@ class GuardApp:
             self.config_error = str(exc)
             self.config = read_settings(BASE / "__unused_defaults__.json")
         root.title(f"Network Guard · 网络守护 {VERSION}")
+        apply_window_icon(root)
         root.geometry("1080x780")
         root.minsize(900, 700)
         root.configure(bg=BG)

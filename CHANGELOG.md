@@ -10,6 +10,7 @@
 - 发布工作流（`.github/workflows/release.yml`）在 `v*` 标签触发时安装 Inno Setup，构建目录版 ZIP 与安装包，并一并上传到 Release；原有的测试、版本一致性校验与 SHA-256 校验保持。
 - 中文安装界面使用 Inno Setup 官方 `ChineseSimplified.isl`（随仓库提供，便于离线构建）。
 - 打包版补齐 **CLI 入口**：新增控制台程序 `NetworkGuardCLI.exe` 与 `start_cli.bat`，安装包开始菜单同时创建「Network Guard（命令行）」快捷方式。此前打包版只有窗口化的 `NetworkGuard.exe`，`start_cli.bat` 指向源码 `src/main.py`，安装后无法使用命令行模式。
+- **新增项目图标**：Q 版图作为 README 头图与 GUI 图标（窗口、任务栏、exe、安装包/卸载项），平面版图作为命令行程序的图标（`NetworkGuardCLI.exe`）；多尺寸 ICO 与源图放在 `assets/`。
 - 本地已验证：静默安装到指定目录（999 个文件）、安装日志确认执行了 `Unblock-File`、真实注入的 `Zone.Identifier` 被清除、静默卸载后目录清理干净。
 
 **修复「Wi-Fi 被系统关闭后不再重连」**

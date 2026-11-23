@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/app-icon.png" width="180" alt="Network Guard 图标">
+</p>
+
 # Network Guard 网络守护
 
 Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重”自动修复有线和无线连接。
@@ -123,6 +127,7 @@ src/
   installer.iss                      安装包脚本（自选目录、安装时清除下载标记）
   ChineseSimplified.isl              安装界面中文语言文件（Inno Setup 官方）
 tests/                               单元测试与版本一致性校验
+assets/                              图标：Q 版（GUI/README）、平面版（CLI）与多尺寸 ICO
 config/network_guard_config.example.json   配置模板（不含真实信息）
 docs/LEGACY_REVIEW.md                与初始脚本的对照
 start_gui.bat / start_cli.bat        双击启动
