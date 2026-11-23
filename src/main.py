@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -73,6 +74,46 @@ def redact(text: str) -> str:
 	text = _NETWORK_FIELD_RE.sub(lambda match: f"{match.group(1)}: <redacted>", text)
 	text = _DATACLASS_FIELD_RE.sub(lambda match: f"{match.group(1)}='<redacted>'", text)
 	return text
+
+
+# Characters that can rewrite a terminal/log line or smuggle a second line:
+# control (Cc), format/bidi (Cf) and surrogate (Cs) code points. An SSID is
+# attacker-controlled input, so it must never reach a log or a line-based
+# file verbatim.
+_UNSAFE_NAME_CATEGORIES = ("Cc", "Cf", "Cs")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def has_unsafe_name_chars(value: str) -> bool:
+	return any(unicodedata.category(ch) in _UNSAFE_NAME_CATEGORIES for ch in value)
+
+
+def is_safe_profile_name(value: str | None) -> bool:
+	"""Whether a Wi-Fi profile/SSID name may be used for connect attempts.
+
+	Names with control characters are refused: they can corrupt log lines,
+	the single-line state file, or netsh argument parsing.
+	"""
+	if not value or not value.strip() or len(value) > 512:
+		return False
+	return not has_unsafe_name_chars(value)
+
+
+def display_name(value: str | None, limit: int = 80) -> str:
+	"""One-line, terminal-safe rendering of an attacker-controlled name."""
+	text = "".join(
+		ch for ch in str(value or "")
+		if unicodedata.category(ch) not in _UNSAFE_NAME_CATEGORIES
+	)
+	text = " ".join(text.split())
+	return text[:limit] or "(空)"
+
+
+class SafeFormatter(logging.Formatter):
+	"""Strip CR and ANSI escapes so a crafted SSID cannot forge log lines."""
+
+	def format(self, record: logging.LogRecord) -> str:
+		return _ANSI_ESCAPE_RE.sub("", super().format(record)).replace("\r", "")
 
 
 @dataclass(frozen=True)
@@ -319,7 +360,7 @@ def configure_logging(log_file: Path, verbose: bool, max_bytes: int = 2 * 1024 *
 	logger.setLevel(logging.DEBUG)
 	logger.handlers.clear()
 
-	formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+	formatter = SafeFormatter("%(asctime)s | %(levelname)s | %(message)s")
 
 	# 必须在打开 handler 之前取样：崩溃回放只能包含上一次会话写入的内容，
 	# 否则本次启动的诊断日志会被误当成“崩溃前的最后几行”。
@@ -351,24 +392,28 @@ def ensure_windows(logger: logging.Logger) -> None:
 		raise SystemExit(1)
 
 
-def run_command(command: list[str], logger: logging.Logger, timeout: int | None = 30) -> subprocess.CompletedProcess[str]:
+def run_command(command: list[str], logger: logging.Logger, timeout: int | None = 30,
+		env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
 	"""Run a command but never let a wedged child freeze the monitor loop.
 
 	``netsh`` can block inside the WLAN driver, where ``kill()`` does not
 	return and ``subprocess.run(timeout=)`` would hang forever. The wait is
 	therefore bounded by a daemon thread: if it is still alive we abandon it
 	and report a timeout, because a daemon thread cannot keep the process up.
+
+	``env`` lets callers pass attacker-controlled strings as environment
+	variables instead of splicing them into a PowerShell script.
 	"""
 	logger.debug("执行命令: %s (超时: %s 秒)", " ".join(command), timeout or "无限")
 	if timeout is None:
-		return _execute(command, logger, None)
+		return _execute(command, logger, None, env)
 
 	bucket: list[subprocess.CompletedProcess[str]] = []
 	failure: list[BaseException] = []
 
 	def _target() -> None:
 		try:
-			bucket.append(_execute(command, logger, timeout))
+			bucket.append(_execute(command, logger, timeout, env))
 		except BaseException as exc:  # noqa: BLE001
 			failure.append(exc)
 
@@ -393,13 +438,15 @@ def run_command(command: list[str], logger: logging.Logger, timeout: int | None 
 	return subprocess.CompletedProcess(args=command, returncode=-1, stdout="", stderr="")
 
 
-def _execute(command: list[str], logger: logging.Logger, timeout: int | None) -> subprocess.CompletedProcess[str]:
+def _execute(command: list[str], logger: logging.Logger, timeout: int | None,
+		env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
 	try:
 		completed = subprocess.run(
 			command,
 			capture_output=True,
 			shell=False,
 			timeout=timeout,
+			env=env,
 			creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
 		)
 	except subprocess.TimeoutExpired:
@@ -476,10 +523,16 @@ def read_state_file(state_file: Path) -> str | None:
 		value = state_file.read_text(encoding="utf-8").strip()
 	except OSError:
 		return None
+	if not is_safe_profile_name(value):
+		return None
 	return value or None
 
 
 def write_state_file(state_file: Path, profile_name: str, logger: logging.Logger) -> None:
+	# The state file is line-based; a crafted profile name must not add lines.
+	if not is_safe_profile_name(profile_name):
+		logger.debug("跳过写入含控制字符的状态文件内容")
+		return
 	try:
 		state_file.write_text(profile_name.strip(), encoding="utf-8")
 	except OSError as exc:
@@ -602,7 +655,7 @@ def get_saved_profiles(logger: logging.Logger) -> list[str]:
 			continue
 		seen.add(key)
 		deduped.append(profile)
-	logger.debug("已保存的 Wi-Fi 配置: %s", deduped)
+	logger.debug("已保存的 Wi-Fi 配置: %s", [display_name(name) for name in deduped])
 	return deduped
 
 
@@ -683,22 +736,26 @@ _RADIO_OFF_OUTPUT_RE = re.compile(
 
 
 def connect_wifi(profile_name: str, logger: logging.Logger, interface_name: str | None) -> bool:
+	if not is_safe_profile_name(profile_name):
+		logger.warning("跳过名称含控制字符的 Wi-Fi 配置：%s", display_name(profile_name))
+		return False
 	command = ["netsh", "wlan", "connect", f"name={profile_name}"]
 	if interface_name:
 		command.append(f"interface={interface_name}")
-	logger.debug("发起 Wi-Fi 连接请求: %s", profile_name)
+	logger.debug("发起 Wi-Fi 连接请求: %s", display_name(profile_name))
 	completed = run_command(command, logger, timeout=15)
 	if completed.returncode != 0:
 		output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
 		if _RADIO_OFF_OUTPUT_RE.search(output):
 			logger.error(
 				"⛔ 系统报告无线接口电源关闭（无线电被关闭），连接请求被拒绝: %s",
-				profile_name,
+				display_name(profile_name),
 			)
 		else:
-			logger.warning("尝试连接 Wi-Fi 配置失败: %s (返回码: %s)", profile_name, completed.returncode)
+			logger.warning("尝试连接 Wi-Fi 配置失败: %s (返回码: %s)",
+				display_name(profile_name), completed.returncode)
 		return False
-	logger.info("已发起连接请求: %s", profile_name)
+	logger.info("已发起连接请求: %s", display_name(profile_name))
 	return True
 
 
@@ -944,6 +1001,12 @@ def recover_network(
 	saved_profiles = get_saved_profiles(logger)
 	last_successful = read_state_file(state_file)
 	candidates = choose_profiles_to_try(preferred_profiles, last_successful, saved_profiles, disabled_profiles, enabled_profiles)
+	# SSID/配置名是外部输入：带控制字符（换行、ANSI、双向覆盖等）的一律不参与，
+	# 避免日志/状态文件被伪造，也避免把异常参数交给 netsh。
+	unsafe = [name for name in candidates if not is_safe_profile_name(name)]
+	if unsafe:
+		logger.warning("跳过 %d 个名称含控制字符/异常的 Wi-Fi 配置，不再尝试连接。", len(unsafe))
+		candidates = [name for name in candidates if is_safe_profile_name(name)]
 
 	if not candidates:
 		logger.warning("没有可参与恢复的 Wi-Fi 配置（未保存配置或已全部禁用）。")
@@ -973,22 +1036,22 @@ def recover_network(
 			return False
 
 		remaining_time = int(deadline - time.time())
-		logger.info("[%d/%d] 尝试连接 Wi-Fi 配置: %s (剩余时间: %d 秒)", idx, len(candidates), profile_name, remaining_time)
+		logger.info("[%d/%d] 尝试连接 Wi-Fi 配置: %s (剩余时间: %d 秒)", idx, len(candidates), display_name(profile_name), remaining_time)
 		
 		if not connect_wifi(profile_name, logger, interface_name):
-			logger.debug("配置 %s 连接请求发送失败，跳过", profile_name)
+			logger.debug("配置 %s 连接请求发送失败，跳过", display_name(profile_name))
 			continue
 
 		attempt_deadline = min(deadline, time.time() + 20)
 		check_interval = 3
 		attempts = 0
 		
-		logger.debug("等待配置 %s 的网络恢复（最多 20 秒）...", profile_name)
+		logger.debug("等待配置 %s 的网络恢复（最多 20 秒）...", display_name(profile_name))
 		while time.time() < attempt_deadline:
 			attempts += 1
 			if is_internet_reachable(logger, check_targets):
 				elapsed_time = int(time.time() - (deadline - reconnect_timeout))
-				logger.info("✓ 网络已恢复！配置: %s，总耗时: %d 秒，尝试次数: %d", profile_name, elapsed_time, attempts)
+				logger.info("✓ 网络已恢复！配置: %s，总耗时: %d 秒，尝试次数: %d", display_name(profile_name), elapsed_time, attempts)
 				write_state_file(state_file, profile_name, logger)
 				return True
 			
@@ -998,7 +1061,7 @@ def recover_network(
 			
 			time.sleep(check_interval)
 
-		logger.warning("配置 %s 已发起连接，但在 20 秒内仍未恢复联网 (尝试 %d 次)", profile_name, attempts)
+		logger.warning("配置 %s 已发起连接，但在 20 秒内仍未恢复联网 (尝试 %d 次)", display_name(profile_name), attempts)
 
 	logger.error("✗ 已尝试全部 %d 个候选 Wi-Fi 配置，网络仍未恢复。", len(candidates))
 

@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import atexit
 import ctypes
 import json
+import os
 import socket
 import sys
 import time
@@ -44,11 +45,11 @@ _last_adapter_reset_time = 0.0
 _last_proxy_cleanup_time = 0.0
 
 
-def _run(command: list[str], logger, timeout: int | None = 30):
+def _run(command: list[str], logger, timeout: int | None = 30, env: dict[str, str] | None = None):
     """Call ``main.run_command`` lazily to avoid a circular import."""
     import main as guard
 
-    return guard.run_command(command, logger, timeout)
+    return guard.run_command(command, logger, timeout, env)
 
 
 # ---------------------------------------------------------------- sleep guard
@@ -420,11 +421,21 @@ def renew_dhcp(logger, interface_name: str, reason: list[str] | None = None) -> 
 
 
 def _reset_named_adapter(logger, adapter_name: str) -> bool:
-    """Disable/enable one named adapter, verifying the state afterwards."""
+    """Disable/enable one named adapter, verifying the state afterwards.
+
+    The adapter name is passed through an environment variable and read inside
+    PowerShell, never spliced into the script text: adapter names are local
+    strings that may contain quotes or other PowerShell syntax.
+    """
+    import main as guard
+
+    if not adapter_name or guard.has_unsafe_name_chars(adapter_name):
+        logger.warning("跳过名称含控制字符的网卡重置")
+        return False
     script = (
         '$ErrorActionPreference = "Stop"; '
         "try { "
-        f"  $adapter = Get-NetAdapter -Name '{adapter_name}' -ErrorAction Stop; "
+        '  $adapter = Get-NetAdapter -Name $env:NG_ADAPTER_NAME -ErrorAction Stop; '
         '  if ($adapter.Status -eq "Disabled") { '
         "    Enable-NetAdapter -Name $adapter.Name -Confirm:$false; "
         "  } else { "
@@ -444,8 +455,11 @@ def _reset_named_adapter(logger, adapter_name: str) -> bool:
         "  } "
         "}"
     )
+    environment = dict(os.environ)
+    environment["NG_ADAPTER_NAME"] = adapter_name
     try:
-        completed = _run(["powershell", "-NoProfile", "-Command", script], logger, 25)
+        completed = _run(["powershell", "-NoProfile", "-Command", script], logger, 25,
+                         env=environment)
         lines = (completed.stdout or "").strip().splitlines()
         last = lines[-1] if lines else ""
         if last.startswith("OK:"):

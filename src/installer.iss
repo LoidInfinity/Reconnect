@@ -73,10 +73,40 @@ Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\NetworkGuard.exe"; Tasks: desktopicon
 
 [Run]
-; 清除下载标记：安装包内的文件本身可能带 Mark of the Web，复制后统一清一遍，
-; 避免用户双击安装目录里的 .bat 时再次看到「无法验证发布者」。
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-ChildItem -LiteralPath '{app}' -Recurse -File -Force -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue"""; StatusMsg: "正在清除下载标记…"; Flags: runhidden waituntilterminated
 Filename: "{app}\NetworkGuard.exe"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+{ 清除下载标记（Mark of the Web）。
+  直接在安装程序内用 DeleteFile 删除 :Zone.Identifier 数据流：
+  不再通过 powershell -Command 拼接安装路径，避免路径中的引号被当成脚本执行。 }
+procedure DeleteZoneIdentifier(const Directory: String);
+var
+  FindRec: TFindRec;
+  ItemPath: String;
+begin
+  if not FindFirst(AddBackslash(Directory) + '*', FindRec) then
+    exit;
+  try
+    repeat
+      if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+      begin
+        ItemPath := AddBackslash(Directory) + FindRec.Name;
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          DeleteZoneIdentifier(ItemPath)
+        else
+          DeleteFile(ItemPath + ':Zone.Identifier');
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    DeleteZoneIdentifier(ExpandConstant('{app}'));
+end;
 
 [UninstallDelete]
 ; 安装目录内的运行残留（如用户手动生成的日志）一并清理；用户数据目录不在此处，卸载后保留。

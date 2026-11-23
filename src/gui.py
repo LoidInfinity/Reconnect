@@ -61,7 +61,17 @@ def load_hidden_profiles(path: Path) -> list[str]:
 
 def save_hidden_profiles(path: Path, names: list[str]) -> Path:
     """Write the hidden list; fall back to the data dir if config/ is read-only."""
-    body = "\n".join(names)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        text = str(name or "")
+        if not text.strip() or guard.has_unsafe_name_chars(text):
+            continue
+        key = text.casefold()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(text)
+    body = "\n".join(cleaned)
     error: OSError | None = None
     for candidate in (path, DATA_DIR / "hidden_wifi.txt"):
         try:
@@ -128,6 +138,13 @@ def validate_settings(data: dict) -> dict:
             raise ValueError(f"检测地址无效：{target}")
     if data.get("interface") is not None and not isinstance(data["interface"], str):
         raise ValueError("网卡名称必须是文字")
+    interface_value = data.get("interface")
+    if interface_value and guard.has_unsafe_name_chars(interface_value):
+        raise ValueError("网卡名称含控制字符")
+    for key in ("preferred_profiles", "disabled_profiles", "dns_reset_interfaces"):
+        for item in result[key]:
+            if guard.has_unsafe_name_chars(item):
+                raise ValueError(f"{key} 含控制字符")
     for key in ("log_file", "state_file", "pid_file"):
         if not isinstance(data[key], str) or not data[key].strip():
             raise ValueError(f"{key} 不能为空")
@@ -303,6 +320,7 @@ class GuardApp:
                 pass
             self.config.pop("hidden_profiles", None)
         self._profile_order: list[str] = []
+        self._raw_names: dict[str, str] = {}
         self._sort_column: str | None = None
         self._sort_ascending = True
         root.title(f"Network Guard · 网络守护 {VERSION}")
@@ -641,7 +659,7 @@ class GuardApp:
         if not selection:
             self.notice.configure(text="请先选择一个 Wi-Fi 配置")
             return
-        name = self.profiles.item(selection[0], "values")[0]
+        name = self._name_of(selection[0])
         widget = self.fields["preferred_profiles"]
         existing = [x.strip() for x in widget.get("1.0", "end").splitlines() if x.strip() and x.strip().casefold() != name.casefold()]
         widget.delete("1.0", "end")
@@ -659,7 +677,7 @@ class GuardApp:
         if not enabled:
             self.notice.configure(text="请先勾选要保留的 Wi-Fi，再从列表移除其余项")
             return
-        names = [self.profiles.item(item, "values")[0] for item in self.profiles.get_children()]
+        names = [self._name_of(item) for item in self.profiles.get_children()]
         targets = [name for name in names if name.casefold() not in enabled]
         if not targets:
             self.notice.configure(text="列表中没有未选定的 Wi-Fi")
@@ -696,7 +714,7 @@ class GuardApp:
         self.config = data
         self._profile_order = [name for name in self._profile_order if name.casefold() not in target_keys]
         for item in self.profiles.get_children():
-            if self.profiles.item(item, "values")[0].casefold() in target_keys:
+            if self._name_of(item).casefold() in target_keys:
                 self.profiles.delete(item)
         self.update_priorities()
         self.update_restore_button()
@@ -722,10 +740,14 @@ class GuardApp:
         else:
             self.restore_button.configure(text="恢复已隐藏", state="disabled")
 
+    def _name_of(self, item: str) -> str:
+        """Raw profile name for a row (display text may be sanitized)."""
+        return self._raw_names.get(item, self.profiles.item(item, "values")[0])
+
     def priority_order(self) -> list[str]:
         """Effective recovery order: preferred first, then the saved order."""
         names = self._profile_order or [
-            self.profiles.item(item, "values")[0] for item in self.profiles.get_children()
+            self._name_of(item) for item in self.profiles.get_children()
         ]
         known = {name.casefold(): name for name in names}
         preferred = [name for name in self.config.get("preferred_profiles", [])
@@ -738,10 +760,10 @@ class GuardApp:
         enabled = {x.casefold() for x in (self.config.get("enabled_profiles") or [])}
         rank = {name.casefold(): index + 1 for index, name in enumerate(self.priority_order())}
         for item in self.profiles.get_children():
-            name = self.profiles.item(item, "values")[0]
+            name = self._name_of(item)
             priority = rank.get(name.casefold())
             self.profiles.item(item, values=(
-                name,
+                guard.display_name(name),
                 str(priority) if priority else "—",
                 "☑ 使用" if name.casefold() in enabled and name.casefold() not in disabled else "☐ 不使用",
             ))
@@ -758,20 +780,23 @@ class GuardApp:
     def _apply_sort(self):
         if not self._sort_column:
             return
-        rows = [list(self.profiles.item(item, "values")) for item in self.profiles.get_children()]
+        rows = [(self._name_of(item), list(self.profiles.item(item, "values")))
+                for item in self.profiles.get_children()]
         if self._sort_column == "priority":
-            def key(row):
-                return int(row[1]) if str(row[1]).isdigit() else 10 ** 6
+            def key(pair):
+                return int(pair[1][1]) if str(pair[1][1]).isdigit() else 10 ** 6
         elif self._sort_column == "enabled":
-            def key(row):
-                return 0 if str(row[2]).startswith("☑") else 1
+            def key(pair):
+                return 0 if str(pair[1][2]).startswith("☑") else 1
         else:
-            def key(row):
-                return str(row[0]).casefold()
+            def key(pair):
+                return str(pair[1][0]).casefold()
         rows.sort(key=key, reverse=not self._sort_ascending)
         self.profiles.delete(*self.profiles.get_children())
-        for row in rows:
-            self.profiles.insert("", "end", values=row)
+        self._raw_names.clear()
+        for name, values in rows:
+            item = self.profiles.insert("", "end", values=values)
+            self._raw_names[item] = name
         self._update_sort_arrows()
 
     def _update_sort_arrows(self):
@@ -782,7 +807,7 @@ class GuardApp:
 
     def apply_list_order(self):
         """Persist the current (possibly sorted) row order as priority order."""
-        order = [self.profiles.item(item, "values")[0] for item in self.profiles.get_children()]
+        order = [self._name_of(item) for item in self.profiles.get_children()]
         if not order:
             self.notice.configure(text="列表为空，无法设置优先顺序")
             return
@@ -811,7 +836,7 @@ class GuardApp:
         return "break"
 
     def toggle_profile(self, item):
-        name = self.profiles.item(item, "values")[0]
+        name = self._name_of(item)
         disabled = list(self.config["disabled_profiles"])
         enabled = list(self.config["enabled_profiles"] or [])
         was_disabled = name.casefold() not in {x.casefold() for x in enabled} or name.casefold() in {x.casefold() for x in disabled}
@@ -1004,8 +1029,10 @@ class GuardApp:
                             continue
                         self.config = data
                     self.profiles.delete(*self.profiles.get_children())
+                    self._raw_names.clear()
                     for name in visible:
-                        self.profiles.insert("", "end", values=(name, "—"))
+                        item = self.profiles.insert("", "end", values=(guard.display_name(name), "—"))
+                        self._raw_names[item] = name
                     name_font = tkfont.Font(family="Microsoft YaHei UI", size=10)
                     name_width = max([180] + [name_font.measure(name) + 24 for name in visible])
                     self.profiles.column("name", width=name_width, minwidth=name_width)

@@ -22,6 +22,13 @@ class SettingsTests(unittest.TestCase):
         gui.save_settings(self.path, gui.validate_settings(self.config))
         self.assertEqual(gui.read_settings(self.path), self.config)
 
+    def test_control_characters_are_rejected(self):
+        for change in (dict(interface="WLAN\nx"), dict(preferred_profiles=["a\nb"]),
+                       dict(disabled_profiles=["a\x1bb"]), dict(dns_reset_interfaces=["x\ry"])):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                gui.validate_settings(dict(self.config, **change))
+
+
     def test_invalid_inputs_rejected(self):
         for change in [dict(interval="0"), dict(interval="1.2"),
                        dict(check_targets=["file:///local"]), dict(check_targets=[]),
@@ -139,6 +146,7 @@ class HideProfilesTests(unittest.TestCase):
             self.profiles = HideProfilesTests._Profiles(rows)
             self.hidden_file = self.directory / "hidden_wifi.txt"
             self._profile_order = [row[0] for row in rows]
+            self._raw_names = {}
             self._sort_column = None
             self._sort_ascending = True
             self._heading_labels = {"name": "Wi-Fi 配置名称", "priority": "优先顺序",
@@ -164,6 +172,9 @@ class HideProfilesTests(unittest.TestCase):
 
         def update_priorities(self):
             gui.GuardApp.update_priorities(self)
+
+        def _name_of(self, item):
+            return self.profiles.item(item, "values")[0]
 
         def priority_order(self):
             return gui.GuardApp.priority_order(self)

@@ -6,7 +6,7 @@
 
 Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重”自动修复有线和无线连接。
 
-当前版本 **0.1.0-rc.3** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md)
+当前版本 **0.1.0-rc.3** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md) · [安全说明](docs/SECURITY.md)
 
 ## 安装版（Setup.exe）
 
@@ -130,6 +130,7 @@ tests/                               单元测试与版本一致性校验
 assets/                              图标：Q 版（GUI/README）、平面版（CLI）与多尺寸 ICO
 config/network_guard_config.example.json   配置模板（不含真实信息）
 docs/LEGACY_REVIEW.md                与初始脚本的对照
+docs/SECURITY.md                     安全边界、SSID 注入防护与残余风险
 start_gui.bat / start_cli.bat        双击启动
 install_admin_task.bat / enable_wlan.bat   开机自启 / 手动启用无线网卡
 requirements-build.txt / CHANGELOG.md / LICENSE
@@ -214,6 +215,12 @@ git push origin v0.1.0-rc.3
 GUI 的 Wi-Fi 隐藏名单存在程序目录下的 `config\hidden_wifi.txt`（打包版为安装目录下的同名文件；无写入权限时回退到数据目录），该文件已加入 `.gitignore`，不会入库。
 
 相对路径以数据目录为基准，因此开机自启（工作目录往往是 `System32`）也不会写错位置。旧版本散落在项目根目录的文件会在首次启动时自动迁移到上述位置。
+
+## 安全提示
+
+SSID / 配置名被当作**不可信输入**处理：所有命令走参数列表（`shell=False`），PowerShell 不再拼接变量，含换行/ANSI/双向控制符的名称不参与重连，日志与单行名单文件都会清洗；安装包也不再通过 PowerShell 拼接安装路径。详见 [安全说明](docs/SECURITY.md)。
+
+程序**无法识别同名热点（邪恶双胞胎）**：重连只按配置名进行，AP 身份由 Windows 的 WPA/802.1X 负责。开放网络（无密码）容易被同名伪造，敏感场景请配合 VPN 或改用有认证的网络。
 
 ## 隐私说明
 
