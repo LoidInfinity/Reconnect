@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import tkinter as tk
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -97,6 +98,84 @@ class WorkerTests(unittest.TestCase):
                     logger.removeHandler(handler)
 
 
+class DeleteProfilesTests(unittest.TestCase):
+    """「删除未选定的 Wi-Fi」逻辑无需真实 Tk 窗口即可验证。"""
+
+    class _Profiles:
+        def __init__(self, names):
+            self._names = list(names)
+
+        def get_children(self):
+            return list(range(len(self._names)))
+
+        def item(self, index, option=None):
+            return (self._names[index], "—", "☐ 不使用")
+
+    class _App:
+        def __init__(self, path, config, names):
+            self.config_path = path
+            self.config = dict(config)
+            self.profiles = DeleteProfilesTests._Profiles(names)
+            self.notices = []
+            self.refresh_count = 0
+            self.root = None
+            self.notice = SimpleNamespace(
+                configure=lambda **kwargs: self.notices.append(kwargs.get("text", ""))
+            )
+
+        def refresh(self):
+            self.refresh_count += 1
+
+    def _app(self, directory, config, names):
+        return self._App(Path(directory) / "config.json", config, names)
+
+    def test_removes_only_unchecked_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory, dict(enabled_profiles=["Home"], disabled_profiles=["Office"],
+                                           preferred_profiles=["Office"]), ["Home", "Office"])
+            with patch.object(gui.messagebox, "askyesno", return_value=True) as ask, \
+                 patch.object(gui.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+                gui.GuardApp.delete_unselected(app)
+            ask.assert_called_once()
+            run.assert_called_once()
+            self.assertEqual(run.call_args[0][0],
+                             ["netsh", "wlan", "delete", "profile", "name=Office"])
+            saved = gui.read_settings(app.config_path)
+            self.assertEqual(saved["disabled_profiles"], [])
+            self.assertEqual(saved["preferred_profiles"], [])
+            self.assertEqual(app.refresh_count, 1)
+            self.assertIn("已删除 1 个", app.notices[-1])
+
+    def test_cancel_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory, dict(enabled_profiles=["Home"], disabled_profiles=["Office"]),
+                            ["Home", "Office"])
+            with patch.object(gui.messagebox, "askyesno", return_value=False), \
+                 patch.object(gui.subprocess, "run") as run:
+                gui.GuardApp.delete_unselected(app)
+            run.assert_not_called()
+            self.assertEqual(app.refresh_count, 0)
+            self.assertEqual(app.config["disabled_profiles"], ["Office"])
+
+    def test_no_unchecked_profile_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(directory, dict(enabled_profiles=["Home"]), ["Home"])
+            with patch.object(gui.subprocess, "run") as run:
+                gui.GuardApp.delete_unselected(app)
+            run.assert_not_called()
+            self.assertIn("没有未选定", app.notices[-1])
+
+    def test_empty_whitelist_refuses_to_delete_everything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for enabled in (None, []):
+                with self.subTest(enabled=enabled):
+                    app = self._app(directory, dict(enabled_profiles=enabled), ["Home", "Office"])
+                    with patch.object(gui.subprocess, "run") as run:
+                        gui.GuardApp.delete_unselected(app)
+                    run.assert_not_called()
+                    self.assertIn("请先勾选", app.notices[-1])
+
+
 class WindowTests(unittest.TestCase):
     def setUp(self):
         # 无交互桌面的环境（如 CI）无法真正完成窗口布局，
@@ -126,7 +205,7 @@ class WindowTests(unittest.TestCase):
                         def check_widgets(widget):
                             if str(widget) in hidden_tabs:
                                 return
-                            if widget.winfo_ismapped() and isinstance(widget, (gui.ttk.Label, gui.ttk.Button, gui.ttk.Entry, gui.ttk.Checkbutton, tk.Label)):
+                            if widget.winfo_ismapped() and isinstance(widget, (gui.ttk.Label, gui.ttk.Button, gui.ttk.Entry, tk.Checkbutton, tk.Label)):
                                 self.assertGreaterEqual(widget.winfo_height(), widget.winfo_reqheight(), str(widget))
                                 self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth(), str(widget))
                             for child in widget.winfo_children():
@@ -215,6 +294,16 @@ class WindowTests(unittest.TestCase):
                     app.poll()
                     self.assertIsNone(app.process)
                     self.assertIn("已停止", app.status.cget("text"))
+                # 滚轮在列表/日志上滚动它们自己，而不是整个页签
+                self.assertFalse(gui.wheel_scrolls_container(app.profiles))
+                self.assertFalse(gui.wheel_scrolls_container(app.log_text))
+                self.assertTrue(gui.wheel_scrolls_container(app.notice))
+                # 设置项使用带对勾的原生复选框，而不是 clam 主题的 X 形
+                self.assertEqual(len(app.switch_buttons), 7)
+                for button in app.switch_buttons:
+                    self.assertIsInstance(button, tk.Checkbutton)
+                    self.assertNotIsInstance(button, gui.ttk.Checkbutton)
+                self.assertIsInstance(app.verbose_button, tk.Checkbutton)
             finally:
                 for timer in root.tk.call("after", "info"):
                     root.after_cancel(timer)

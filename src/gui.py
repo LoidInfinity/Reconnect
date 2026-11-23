@@ -41,6 +41,11 @@ def wrap_label(label, parent, margin: int = 0) -> None:
 BLUE = "#2563eb"
 
 
+def wheel_scrolls_container(widget) -> bool:
+    """Wheel over a list/text view must scroll that view, not the whole tab."""
+    return not isinstance(widget, (ttk.Treeview, tk.Text))
+
+
 def read_settings(path: Path) -> dict:
     defaults = dict(interval=10, reconnect_timeout=35,
                     check_targets=list(guard.DEFAULT_CHECK_TARGETS),
@@ -313,6 +318,8 @@ class GuardApp:
                 bar.pack_forget()
 
         def on_wheel(event):
+            if not wheel_scrolls_container(event.widget):
+                return None
             canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
             return "break"
 
@@ -326,6 +333,17 @@ class GuardApp:
         notebook.add(outer, text=title)
         self.root.after_idle(sync)
         return content, bind_wheel, canvas
+
+    def _checkbutton(self, parent, text, variable):
+        """Native check mark instead of clam's X-shaped indicator.
+
+        The clam theme draws a cross for a selected checkbutton, which reads
+        like "off" or "error"; tk.Checkbutton renders a familiar tick.
+        """
+        return tk.Checkbutton(parent, text=text, variable=variable, bg=BG,
+                              activebackground=BG, selectcolor="white",
+                              font=("Microsoft YaHei UI", 10), anchor="w",
+                              bd=0, highlightthickness=0)
 
     def build_ui(self):
         style = ttk.Style()
@@ -428,7 +446,11 @@ class GuardApp:
         self.profiles.pack(fill="both", expand=True)
         self.profiles.bind("<Button-1>", self.toggle_clicked)
         self.profiles.bind("<space>", self.toggle_selected)
-        ttk.Button(networks, text="将所选 Wi-Fi 设为首选", command=self.prefer).pack(anchor="w", pady=8)
+        network_actions = ttk.Frame(networks)
+        network_actions.pack(fill="x", pady=8)
+        ttk.Button(network_actions, text="将所选 Wi-Fi 设为首选", command=self.prefer).pack(side="left")
+        self.delete_button = ttk.Button(network_actions, text="删除未选定的 Wi-Fi", command=self.delete_unselected)
+        self.delete_button.pack(side="left", padx=8)
         self.profile_hint = ttk.Label(networks, text="正在读取…", foreground=MUTED)
         self.profile_hint.pack(anchor="w")
         wrap_label(self.profile_hint, networks, 30)
@@ -449,7 +471,8 @@ class GuardApp:
             widget.grid(row=row, column=1, sticky="ew", pady=3)
             self.fields[key] = widget
         self.verbose = tk.BooleanVar()
-        ttk.Checkbutton(settings, text="显示调试日志", variable=self.verbose).grid(row=5, column=1, sticky="w")
+        self.verbose_button = self._checkbutton(settings, "显示调试日志", self.verbose)
+        self.verbose_button.grid(row=5, column=1, sticky="w")
         recovery = ttk.Frame(settings)
         recovery.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(recovery, text="断线自动修复（从轻到重依次尝试）",
@@ -469,9 +492,10 @@ class GuardApp:
             var = tk.BooleanVar()
             self.switches[key] = var
             row, column = divmod(index, 2)
-            widget = ttk.Checkbutton(recovery, text=text, variable=var)
+            widget = self._checkbutton(recovery, text, var)
             widget.grid(row=1 + row, column=column, sticky="w", padx=(0, 18), pady=1)
             switch_widgets.append(widget)
+        self.switch_buttons = switch_widgets
         recovery.columnconfigure(0, weight=1)
         recovery.columnconfigure(1, weight=1)
         # 两列布局所需宽度；窗口太窄时自动退回单列，避免文字被横向裁掉
@@ -572,6 +596,69 @@ class GuardApp:
         widget.delete("1.0", "end")
         widget.insert("1.0", "\n".join([name] + existing))
         self.save()
+
+    def delete_unselected(self):
+        """Delete Wi-Fi profiles that are not checked for recovery.
+
+        ``netsh wlan delete profile`` removes the saved network (and its
+        password), so the list is shown in a confirmation dialog first.
+        """
+        enabled = {name.casefold() for name in (self.config.get("enabled_profiles") or [])}
+        if not enabled:
+            # 一个都没勾选时，"未选定"就是全部配置；直接删会清空所有 Wi-Fi。
+            self.notice.configure(text="请先勾选要保留的 Wi-Fi，再删除未选定的配置")
+            return
+        names = [self.profiles.item(item, "values")[0] for item in self.profiles.get_children()]
+        targets = [name for name in names if name.casefold() not in enabled]
+        if not targets:
+            self.notice.configure(text="没有未选定的 Wi-Fi 配置需要删除")
+            return
+        preview = "、".join(targets[:6]) + ("…" if len(targets) > 6 else "")
+        if not messagebox.askyesno(
+            "删除未选定的 Wi-Fi",
+            f"将从 Windows 删除以下 {len(targets)} 个未选定的 Wi-Fi 配置：\n\n{preview}\n\n"
+            "删除后需要重新输入密码才能再次连接。是否继续？",
+            parent=self.root,
+        ):
+            return
+
+        removed: list[str] = []
+        failed: list[str] = []
+        for name in targets:
+            try:
+                completed = subprocess.run(
+                    ["netsh", "wlan", "delete", "profile", f"name={name}"],
+                    capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except OSError:
+                failed.append(name)
+                continue
+            (removed if completed.returncode == 0 else failed).append(name)
+
+        if removed:
+            deleted = {name.casefold() for name in removed}
+            data = dict(self.config)
+            data["preferred_profiles"] = [
+                name for name in data.get("preferred_profiles", []) if name.casefold() not in deleted
+            ]
+            data["disabled_profiles"] = [
+                name for name in data.get("disabled_profiles", []) if name.casefold() not in deleted
+            ]
+            try:
+                save_settings(self.config_path, data)
+                self.config = data
+            except OSError as exc:
+                self.notice.configure(text=f"已删除 {len(removed)} 个，但保存配置失败：{exc}")
+                self.refresh()
+                return
+        self.refresh()
+        if failed:
+            self.notice.configure(
+                text=f"已删除 {len(removed)} 个；{len(failed)} 个失败（可能需要管理员权限）"
+            )
+        else:
+            self.notice.configure(text=f"已删除 {len(removed)} 个未选定的 Wi-Fi 配置")
 
     def update_priorities(self):
         preferred = [x.casefold() for x in self.config["preferred_profiles"]]
