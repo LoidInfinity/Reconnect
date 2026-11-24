@@ -129,6 +129,7 @@ class RuntimeTests(unittest.TestCase):
             with patch.object(gui.guard, "is_internet_reachable", return_value=True), \
                  patch.object(gui.guard, "get_wifi_interfaces", return_value=[]), \
                  patch.object(gui, "emit"), \
+                 patch.object(repairs, "has_admin_privileges", return_value=False), \
                  patch.object(gui.time, "monotonic", side_effect=[0, 61, 62]), \
                  patch.object(gui.time, "time", side_effect=[0, 600, 600]), \
                  patch.object(gui.time, "sleep", side_effect=[None, KeyboardInterrupt]), \
