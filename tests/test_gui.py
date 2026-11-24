@@ -27,6 +27,11 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gui.validate_settings(dict(self.config, disable_adapter_power_saving="yes"))
 
+    def test_update_channel_defaults_to_stable(self):
+        self.assertEqual(self.config["update_channel"], "stable")
+        with self.assertRaises(ValueError):
+            gui.validate_settings(dict(self.config, update_channel="nightly"))
+
     def test_control_characters_are_rejected(self):
         for change in (dict(interface="WLAN\nx"), dict(preferred_profiles=["a\nb"]),
                        dict(disabled_profiles=["a\x1bb"]), dict(dns_reset_interfaces=["x\ry"])):
@@ -420,6 +425,9 @@ class WindowTests(unittest.TestCase):
                     self.assertIsInstance(button, tk.Checkbutton)
                     self.assertNotIsInstance(button, gui.ttk.Checkbutton)
                 self.assertIsInstance(app.verbose_button, tk.Checkbutton)
+                self.assertEqual(app.update_channel.get(), "稳定版")
+                self.assertEqual(list(app.update_channel_combo.cget("values")),
+                                 ["稳定版", "公测版", "内测版"])
             finally:
                 for timer in root.tk.call("after", "info"):
                     root.after_cancel(timer)

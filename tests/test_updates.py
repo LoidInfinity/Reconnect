@@ -23,6 +23,31 @@ class UpdateTests(unittest.TestCase):
         self.assertTrue(result["url"].startswith(app_info.RELEASES_URL + "/tag/"))
         self.assertFalse(updates.select_release(releases, "0.1.0")["available"])
 
+    def test_update_channels(self):
+        releases = [dict(tag_name="v0.1.1-alpha.1", prerelease=True),
+                    dict(tag_name="v0.1.1-beta.1", prerelease=True),
+                    dict(tag_name="v0.1.1-rc.1", prerelease=True)]
+        stable = updates.select_release(releases, "0.1.0", "stable")
+        self.assertFalse(stable["available"])
+        self.assertIsNone(stable["latest"])
+        beta = updates.select_release(releases, "0.1.0", "beta")
+        self.assertTrue(beta["available"])
+        self.assertEqual(beta["latest"], "v0.1.1-rc.1")
+        alpha = updates.select_release(releases, "0.1.0", "alpha")
+        self.assertEqual(alpha["latest"], "v0.1.1-rc.1")
+        self.assertEqual(alpha["channel"], "alpha")
+        only_alpha = [releases[0]]
+        self.assertFalse(updates.select_release(only_alpha, "0.1.0", "beta")["available"])
+        self.assertTrue(updates.select_release(only_alpha, "0.1.0", "alpha")["available"])
+        with self.assertRaises(ValueError):
+            updates.select_release(releases, "0.1.0", "nightly")
+
+    def test_channel_is_forwarded_to_api(self):
+        payload = json.dumps([dict(tag_name="v0.2.0-alpha.1", prerelease=True)]).encode()
+        with patch.object(updates, "urlopen", side_effect=lambda *a, **k: io.BytesIO(payload)):
+            self.assertTrue(updates.check_updates(current="0.1.0", channel="alpha")["available"])
+            self.assertFalse(updates.check_updates(current="0.1.0", channel="stable")["available"])
+
     def test_empty_same_and_older(self):
         self.assertIsNone(updates.select_release([])["latest"])
         for version in ("0.1.0-alpha.1", app_info.VERSION, "0.0.9"):

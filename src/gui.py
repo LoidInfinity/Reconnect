@@ -23,7 +23,9 @@ from urllib.parse import urlparse
 import main as guard
 from app_info import (VERSION, APP_DIR, DATA_DIR, FROZEN, worker_command, resource_path,
                      hidden_profiles_path)
-from updates import check_updates
+from updates import CHANNEL_LABELS, CHANNELS, check_updates
+
+UPDATE_LABEL_TO_CHANNEL = {label: channel for channel, label in CHANNEL_LABELS.items()}
 
 BASE = APP_DIR
 BG = "#f3f6fb"
@@ -95,7 +97,7 @@ def read_settings(path: Path) -> dict:
                     repair_dns_on_failure=True, dns_check_hosts=list(guard.DEFAULT_DNS_HOSTS), dns_reset_interfaces=[],
                     wired_recovery=True, wired_reset_on_failure=True,
                     wifi_recovery=True, wifi_radio_recovery=True, adapter_reset_on_failure=True,
-                    disable_adapter_power_saving=True)
+                    disable_adapter_power_saving=True, update_channel="stable")
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
@@ -147,6 +149,10 @@ def validate_settings(data: dict) -> dict:
         for item in result[key]:
             if guard.has_unsafe_name_chars(item):
                 raise ValueError(f"{key} 含控制字符")
+    channel = data.get("update_channel", "stable")
+    if channel not in CHANNELS:
+        raise ValueError("更新渠道必须是 stable、beta 或 alpha")
+    result["update_channel"] = channel
     for key in ("log_file", "state_file", "pid_file"):
         if not isinstance(data[key], str) or not data[key].strip():
             raise ValueError(f"{key} 不能为空")
@@ -602,7 +608,16 @@ class GuardApp:
                 layout_switches(width)
 
         settings_canvas.bind("<Configure>", relayout_switches, add="+")
-        ttk.Button(settings, text="保存设置", command=self.save).grid(row=7, column=1, sticky="e", pady=6)
+        update_row = ttk.Frame(settings)
+        update_row.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(update_row, text="检查更新:").pack(side="left")
+        self.update_channel = tk.StringVar()
+        self.update_channel_combo = ttk.Combobox(
+            update_row, textvariable=self.update_channel, state="readonly",
+            values=tuple(CHANNEL_LABELS.values()), width=8)
+        self.update_channel_combo.pack(side="left", padx=(6, 0))
+        ttk.Label(update_row, text="（内测版含 alpha/beta/rc）", foreground=MUTED).pack(side="left", padx=(6, 0))
+        ttk.Button(settings, text="保存设置", command=self.save).grid(row=8, column=1, sticky="e", pady=6)
         bind_settings_wheel(settings)
         toolbar = ttk.Frame(logs)
         toolbar.pack(fill="x", pady=(0, 8))
@@ -648,6 +663,7 @@ class GuardApp:
         self.verbose.set(self.config["verbose"])
         for key, var in self.switches.items():
             var.set(bool(self.config[key]))
+        self.update_channel.set(CHANNEL_LABELS.get(self.config.get("update_channel", "stable"), "稳定版"))
 
     def save(self):
         data = dict(self.config)
@@ -657,6 +673,7 @@ class GuardApp:
         data["verbose"] = self.verbose.get()
         for key, var in self.switches.items():
             data[key] = bool(var.get())
+        data["update_channel"] = UPDATE_LABEL_TO_CHANNEL.get(self.update_channel.get(), "stable")
         try:
             data = validate_settings(data)
             save_settings(self.config_path, data)
@@ -952,7 +969,8 @@ class GuardApp:
         self.update_button.configure(state="disabled", text="正在检查…")
         def task():
             try:
-                self.events.put((None, dict(kind="update", result=check_updates())))
+                channel = UPDATE_LABEL_TO_CHANNEL.get(self.update_channel.get(), "stable")
+                self.events.put((None, dict(kind="update", result=check_updates(channel=channel))))
             except Exception as exc:
                 self.events.put((None, dict(kind="update", error=str(exc))))
         threading.Thread(target=task, daemon=True).start()
@@ -1032,7 +1050,8 @@ class GuardApp:
                     messagebox.showwarning("检查更新失败", event["error"], parent=self.root)
                 elif event["result"]["available"]:
                     result = event["result"]
-                    if messagebox.askyesno("发现新版本", f"当前版本：{VERSION}\n新版本：{result['latest']}\n\n是否打开 GitHub 发布页下载？", parent=self.root):
+                    channel = CHANNEL_LABELS.get(result.get("channel", "stable"), "稳定版")
+                    if messagebox.askyesno("发现新版本", f"当前版本：{VERSION}\n新版本：{result['latest']}（{channel}）\n\n是否打开 GitHub 发布页下载？", parent=self.root):
                         webbrowser.open(result["url"])
                 else:
                     text = "仓库尚未发布可识别的版本。" if event["result"]["latest"] is None else "当前已是最新版本。"

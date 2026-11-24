@@ -7,6 +7,13 @@ from urllib.request import Request, urlopen
 
 from app_info import VERSION, REPOSITORY, RELEASES_URL
 
+# Update channels, from most conservative to most eager:
+#   stable -> only stable releases
+#   beta   -> stable + beta/rc (pre-releases without "alpha")
+#   alpha  -> every release, including alpha
+CHANNELS = ("stable", "beta", "alpha")
+CHANNEL_LABELS = {"stable": "稳定版", "beta": "公测版", "alpha": "内测版"}
+
 
 def version_key(value: str):
     match = re.fullmatch(r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", value)
@@ -20,8 +27,27 @@ def version_key(value: str):
     return (int(major), int(minor), int(patch), pre is None, prerelease)
 
 
-def select_release(releases: list, current: str = VERSION):
+def channel_allows(key, channel: str) -> bool:
+    """Whether a parsed version may be offered on the selected channel."""
+    if channel not in CHANNELS:
+        raise ValueError(f"无效更新渠道：{channel}")
+    is_stable = key[3]
+    if channel == "stable":
+        return is_stable
+    if is_stable:
+        return True
+    labels = [str(value).casefold() for _, value in key[4]]
+    if channel == "beta":
+        return not any(label.startswith("alpha") for label in labels)
+    return True
+
+
+def select_release(releases: list, current: str = VERSION, channel: str | None = None):
     current_key = version_key(current)
+    if channel is None:
+        channel = "alpha" if not current_key[3] else "stable"
+    if channel not in CHANNELS:
+        raise ValueError(f"无效更新渠道：{channel}")
     candidates = []
     for release in releases:
         if not isinstance(release, dict) or release.get("draft"):
@@ -33,18 +59,22 @@ def select_release(releases: list, current: str = VERSION):
             key = version_key(tag)
         except ValueError:
             continue
-        # Alpha versions also receive prereleases; stable versions stay stable.
-        if current_key[3] and (release.get("prerelease") or not key[3]):
+        if not channel_allows(key, channel):
             continue
         candidates.append((key, tag))
     if not candidates:
-        return dict(available=False, latest=None, url=RELEASES_URL)
+        return dict(available=False, latest=None, url=RELEASES_URL, channel=channel)
     key, tag = max(candidates)
     return dict(available=key > current_key, latest=tag,
-                url=RELEASES_URL + "/tag/" + quote(tag, safe=""))
+                url=RELEASES_URL + "/tag/" + quote(tag, safe=""), channel=channel)
 
 
-def check_updates(current: str = VERSION):
+def check_updates(current: str = VERSION, channel: str | None = None):
+    current_key = version_key(current)
+    if channel is None:
+        channel = "alpha" if not current_key[3] else "stable"
+    if channel not in CHANNELS:
+        raise ValueError(f"无效更新渠道：{channel}")
     request = Request(f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100",
                       headers={"Accept": "application/vnd.github+json", "User-Agent": f"NetworkGuard/{current}",
                                "X-GitHub-Api-Version": "2022-11-28"})
@@ -61,4 +91,4 @@ def check_updates(current: str = VERSION):
         raise RuntimeError("GitHub 返回的更新信息无法解析。") from exc
     if not isinstance(releases, list):
         raise RuntimeError("GitHub 返回的更新信息格式不正确。")
-    return select_release(releases, current)
+    return select_release(releases, current, channel)
