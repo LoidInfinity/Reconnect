@@ -17,6 +17,17 @@ LATENCY_FILE = DATA_DIR / "latency.csv"
 MAX_BYTES = 2 * 1024 * 1024
 KEEP_LINES = 20000
 MAX_POINTS = 600
+MAX_TARGETS = 5
+
+
+def effective_targets(targets) -> list[str]:
+    """Only the first five unique HTTP targets are probed and charted."""
+    ordered: list[str] = []
+    for target in targets or []:
+        value = str(target).strip()
+        if value and value not in ordered:
+            ordered.append(value)
+    return ordered[:MAX_TARGETS]
 
 
 def _trim(path: Path) -> None:
@@ -45,6 +56,59 @@ def record_latency(target: str, latency_ms: float | None, ok: bool,
             ])
     except OSError:
         return
+
+
+def read_by_target(targets, hours: int = 24, path: Path | None = None) -> dict:
+    """Per-target series for the first five configured check addresses.
+
+    Returns ``{target: {"points": [(time, ms)...], "failures": [time...]}}`` in
+    configuration order; targets outside the first five are ignored.
+    """
+    ordered = effective_targets(targets)
+    series = {target: {"points": [], "failures": []} for target in ordered}
+    target_path = Path(path or LATENCY_FILE)
+    cutoff = datetime.now() - timedelta(hours=max(1, hours))
+    try:
+        with target_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+            for row in csv.reader(handle):
+                if len(row) < 4:
+                    continue
+                target = row[1]
+                if target not in series:
+                    continue
+                try:
+                    stamp = datetime.fromisoformat(row[0])
+                except ValueError:
+                    continue
+                if stamp < cutoff:
+                    continue
+                if row[3] != "1":
+                    series[target]["failures"].append(stamp)
+                    continue
+                try:
+                    series[target]["points"].append((stamp, float(row[2])))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return series
+
+
+def envelope(series: dict, selected=None, bucket_seconds: int = 60):
+    """Min/max latency per time bucket across the selected target series."""
+    buckets: dict[datetime, list[float]] = {}
+    for target, item in series.items():
+        if selected is not None and target not in selected:
+            continue
+        for stamp, value in item.get("points", []):
+            key = stamp.replace(second=0, microsecond=0)
+            buckets.setdefault(key, []).append(value)
+    lows, highs = [], []
+    for stamp in sorted(buckets):
+        values = buckets[stamp]
+        lows.append((stamp, min(values)))
+        highs.append((stamp, max(values)))
+    return lows, highs
 
 
 def read_series(hours: int = 24, path: Path | None = None) -> tuple[list[tuple[datetime, float]],

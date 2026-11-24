@@ -235,6 +235,9 @@ def _monitor_worker(config_path, config, logger):
                     "radio_repairs": 0, "radio_blocked": 0}
     last_heartbeat = time.monotonic()
     logger.info("守护已启动，检测间隔 %s 秒", config["interval"])
+    if len(config.get("check_targets") or []) > 5:
+        logger.warning("检测地址最多使用前 5 个，其余 %d 个会被忽略。",
+                       len(config["check_targets"]) - 5)
     logger.info("自动修复：代理清理 %s，DNS 修复 %s，有线修复 %s，Wi-Fi 重连 %s，无线电恢复 %s，网卡重置 %s，网卡节能 %s",
                 "开" if config["cleanup_proxy_on_disconnect"] else "关",
                 "开" if config["repair_dns_on_failure"] else "关",
@@ -313,41 +316,70 @@ def apply_window_icon(window) -> None:
 
 
 class LatencyChartWindow(tk.Toplevel):
-    """Latency line chart drawn directly on a Tk canvas.
-
-    The chart is part of the app (no SVG file, no browser): the canvas redraws
-    on resize, and an optional "保存 SVG" button exports a copy for sharing.
-    """
+    """Per-target latency lines drawn on a Tk canvas (no external viewer)."""
 
     HOURS = 24
+    COLORS = ("#2563eb", "#16a34a", "#9333ea", "#db2777", "#0891b2")
+    MIN_COLOR = "#0f766e"
+    MAX_COLOR = "#c2410c"
 
-    def __init__(self, parent):
+    def __init__(self, parent, targets):
         super().__init__(parent)
         self.title("网络延迟")
         self.configure(bg=BG)
-        self.geometry("960x500")
-        self.minsize(680, 380)
+        self.geometry("1000x560")
+        self.minsize(720, 420)
         self.transient(parent)
         apply_window_icon(self)
+        self.targets = guard.latency.effective_targets(targets)
+        self.show_lines = {target: tk.BooleanVar(value=True) for target in self.targets}
+        self.show_min = tk.BooleanVar(value=True)
+        self.show_max = tk.BooleanVar(value=True)
+        self.series = {}
 
         header = ttk.Frame(self)
-        header.pack(fill="x", padx=16, pady=(12, 8))
+        header.pack(fill="x", padx=16, pady=(12, 4))
         ttk.Label(header, text="网络延迟", font=("Microsoft YaHei UI", 15, "bold"),
                   foreground=INK).pack(side="left")
         self.stats = ttk.Label(header, text="", foreground=MUTED)
         self.stats.pack(side="left", padx=(12, 0))
         ttk.Button(header, text="关闭", command=self.destroy).pack(side="right")
-        ttk.Button(header, text="保存 SVG", command=self.save_svg).pack(side="right", padx=(0, 8))
+        ttk.Button(header, text="保存汇总 SVG", command=self.save_svg).pack(side="right", padx=(0, 8))
         ttk.Button(header, text="刷新", command=self.refresh).pack(side="right", padx=(0, 8))
+
+        self.legend = ttk.Frame(self)
+        self.legend.pack(fill="x", padx=16, pady=(0, 6))
+        self._build_legend()
 
         self.canvas = tk.Canvas(self, bg="white", highlightthickness=1,
                                 highlightbackground="#dbe4f0")
         self.canvas.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         self.canvas.bind("<Configure>", self._on_resize)
         self._resize_job = None
-        self.points: list[tuple[datetime, float]] = []
-        self.failures: list[datetime] = []
         self.refresh()
+
+    def _build_legend(self):
+        for index, target in enumerate(self.targets):
+            color = self.COLORS[index % len(self.COLORS)]
+            box = tk.Checkbutton(
+                self.legend, text=self._short(target), variable=self.show_lines[target],
+                command=self.redraw, fg=color, anchor="w",
+                font=("Microsoft YaHei UI", 9))
+            row, column = divmod(index, 3)
+            box.grid(row=row, column=column, sticky="w", padx=(0, 14))
+        row, column = divmod(len(self.targets), 3)
+        tk.Checkbutton(self.legend, text="最低", variable=self.show_min, command=self.redraw,
+                       fg=self.MIN_COLOR, font=("Microsoft YaHei UI", 9)).grid(
+                           row=row, column=column, sticky="w", padx=(0, 14))
+        tk.Checkbutton(self.legend, text="最高", variable=self.show_max, command=self.redraw,
+                       fg=self.MAX_COLOR, font=("Microsoft YaHei UI", 9)).grid(
+                           row=row, column=column + 1, sticky="w", padx=(0, 14))
+
+    @staticmethod
+    def _short(target):
+        parsed = urlparse(target)
+        host = parsed.hostname or target
+        return host if len(host) <= 26 else host[:24] + "…"
 
     def _on_resize(self, event=None):
         if self._resize_job is not None:
@@ -364,13 +396,16 @@ class LatencyChartWindow(tk.Toplevel):
         super().destroy()
 
     def refresh(self):
-        self.points, self.failures = guard.latency.read_series(hours=self.HOURS)
-        summary = guard.latency.stats(self.points)
-        if self.points:
+        self.series = guard.latency.read_by_target(self.targets, hours=self.HOURS)
+        all_points = [point for item in self.series.values() for point in item["points"]]
+        failures = sum(len(item["failures"]) for item in self.series.values())
+        summary = guard.latency.stats(all_points)
+        active = sum(1 for item in self.series.values() if item["points"])
+        if all_points:
             self.stats.configure(
-                text=(f"最近 {self.HOURS} 小时 · 样本 {summary['count']} · "
-                      f"平均 {summary['avg']:.0f} ms · 最高 {summary['max']:.0f} ms · "
-                      f"最新 {summary['last']:.0f} ms · 失败 {len(self.failures)} 次"))
+                text=(f"最近 {self.HOURS} 小时 · 地址 {active}/{len(self.targets)} · "
+                      f"样本 {summary['count']} · 平均 {summary['avg']:.0f} ms · "
+                      f"最新 {summary['last']:.0f} ms · 失败 {failures} 次"))
         else:
             self.stats.configure(text=f"最近 {self.HOURS} 小时 · 暂无数据")
         self.redraw()
@@ -381,7 +416,7 @@ class LatencyChartWindow(tk.Toplevel):
         except OSError as exc:
             self.stats.configure(text=f"导出失败：{exc}")
             return
-        self.stats.configure(text=f"已保存 SVG：{path.name}")
+        self.stats.configure(text=f"已保存汇总 SVG：{path.name}")
 
     def redraw(self):
         self._resize_job = None
@@ -394,10 +429,16 @@ class LatencyChartWindow(tk.Toplevel):
         plot_h = max(10, height - top - bottom)
         baseline = top + plot_h
 
-        if self.points:
-            summary = guard.latency.stats(self.points)
-            y_max = max(10.0, summary["max"] * 1.15)
-            first, last = self.points[0][0], self.points[-1][0]
+        visible = [target for target in self.targets if self.show_lines[target].get()]
+        per_target = {
+            target: guard.latency._downsample(self.series.get(target, {}).get("points", []))
+            for target in visible
+        }
+        visible_points = [point for points in per_target.values() for point in points]
+        if visible_points:
+            y_max = max(10.0, max(value for _, value in visible_points) * 1.15)
+            first = min(stamp for stamp, _ in visible_points)
+            last = max(stamp for stamp, _ in visible_points)
         else:
             y_max = 100.0
             last = datetime.now()
@@ -428,27 +469,52 @@ class LatencyChartWindow(tk.Toplevel):
                                text=stamp.strftime("%m-%d %H:%M"), fill=MUTED,
                                font=("Microsoft YaHei UI", 9))
 
-        if self.points:
+        def draw_line(points, color, width=2, dash=None):
+            if not points:
+                return
             coords = []
-            for stamp, value in self.points:
+            for stamp, value in points:
                 coords.extend((x_of(stamp), y_of(value)))
-            area = [left, baseline] + coords + [left + plot_w, baseline]
-            canvas.create_polygon(area, fill="#eaf2ff", outline="")
-            canvas.create_line(*coords, fill="#2563eb", width=2)
-            last_x, last_y = coords[-2], coords[-1]
-            canvas.create_oval(last_x - 4, last_y - 4, last_x + 4, last_y + 4,
-                               fill="#2563eb", outline="")
-        else:
-            canvas.create_text(left + plot_w / 2, top + plot_h / 2,
-                               text="暂无延迟数据\n让守护运行几分钟后再打开",
+            if len(coords) < 4:
+                canvas.create_oval(coords[0] - 2, coords[1] - 2, coords[0] + 2, coords[1] + 2,
+                                   fill=color, outline="")
+                return
+            canvas.create_line(*coords, fill=color, width=width, dash=dash)
+
+        for index, target in enumerate(self.targets):
+            if target not in visible:
+                continue
+            draw_line(per_target[target], self.COLORS[index % len(self.COLORS)])
+            if per_target[target]:
+                stamp, value = per_target[target][-1]
+                x, y = x_of(stamp), y_of(value)
+                canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                                   fill=self.COLORS[index % len(self.COLORS)], outline="")
+
+        if len(visible) >= 2:
+            lows, highs = guard.latency.envelope(self.series, selected=set(visible))
+            if self.show_min.get():
+                draw_line(guard.latency._downsample(lows), self.MIN_COLOR, 1, (5, 3))
+            if self.show_max.get():
+                draw_line(guard.latency._downsample(highs), self.MAX_COLOR, 1, (5, 3))
+
+        shown_failures = 0
+        for target in visible:
+            for stamp in self.series.get(target, {}).get("failures", []):
+                if shown_failures >= 300:
+                    break
+                x = x_of(stamp)
+                canvas.create_line(x, baseline - 8, x, baseline, fill="#dc2626", width=2)
+                shown_failures += 1
+
+        if not visible_points:
+            has_data = any(item["points"] for item in self.series.values())
+            message = "未选择要显示的地址" if has_data else "暂无延迟数据\n让守护运行几分钟后再打开"
+            canvas.create_text(left + plot_w / 2, top + plot_h / 2, text=message,
                                fill="#94a3b8", font=("Microsoft YaHei UI", 12), justify="center")
 
-        for stamp in self.failures[:300]:
-            x = x_of(stamp)
-            canvas.create_line(x, baseline - 8, x, baseline, fill="#dc2626", width=3)
-
         canvas.create_text(left, height - 12, anchor="w", fill="#94a3b8",
-                           text="蓝色：HTTP 往返延迟    红色：检测失败",
+                           text="彩色：各检测地址 · 虚线：同时刻最低/最高 · 红色：失败",
                            font=("Microsoft YaHei UI", 9))
 
 
@@ -824,7 +890,7 @@ class GuardApp:
             var = tk.StringVar()
             self.fields[key] = var
             ttk.Entry(settings, textvariable=var, font=("Microsoft YaHei UI", 10), width=16).grid(row=row, column=1, sticky="ew", pady=3)
-        for row, key, label in [(3, "preferred_profiles", "首选配置（每行一个）"), (4, "check_targets", "检测地址（每行一个）")]:
+        for row, key, label in [(3, "preferred_profiles", "首选配置（每行一个）"), (4, "check_targets", "检测地址（每行一个，最多使用前 5 个）")]:
             ttk.Label(settings, text=label).grid(row=row, column=0, sticky="nw", pady=3)
             widget = tk.Text(settings, height=2, width=24, font=("Microsoft YaHei UI", 10), relief="solid", bd=1)
             widget.grid(row=row, column=1, sticky="ew", pady=3)
@@ -1341,13 +1407,16 @@ class GuardApp:
 
     def show_latency_chart(self):
         """Open the in-app latency chart window (drawn on a Tk canvas)."""
+        targets = guard.latency.effective_targets(self.config.get("check_targets", []))
         window = getattr(self, "_latency_window", None)
-        if window is not None and window.winfo_exists():
+        if window is not None and window.winfo_exists() and window.targets == targets:
             window.refresh()
             window.lift()
             window.focus_set()
             return
-        self._latency_window = LatencyChartWindow(self.root)
+        if window is not None and window.winfo_exists():
+            window.destroy()
+        self._latency_window = LatencyChartWindow(self.root, targets)
 
     def open_support(self):
         """Open the problem-report dialog: bundle logs or open the log folder."""

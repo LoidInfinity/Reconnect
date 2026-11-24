@@ -743,14 +743,18 @@ def ping_reachable(logger: logging.Logger, timeout_seconds: int = 2) -> bool:
 
 
 def http_reachable(logger: logging.Logger, targets: Iterable[str], timeout_seconds: int = 4) -> bool:
-	"""应用层是否通。每次新建 opener，避免缓存住旧的系统代理设置。
+	"""应用层是否通；任一地址成功即视为在线。
 
-	成功的探测会把往返延迟写入 ``data/latency.csv``，供控制台展示与折线图使用。
+	每次探测都会记录每个地址的延迟（最多前 5 个），单个地址超时不会触发
+	网络重置——只有全部地址都失败才算断网。每次新建 opener，避免缓存住旧
+	的系统代理设置。
 	"""
 	import urllib.request
 
 	_last_probe.update(ms=None, target=None, at=None)
-	for target in targets:
+	selected = latency.effective_targets(targets) or list(DEFAULT_CHECK_TARGETS)
+	online = False
+	for target in selected:
 		started = time.perf_counter()
 		try:
 			opener = urllib.request.build_opener()
@@ -760,16 +764,20 @@ def http_reachable(logger: logging.Logger, targets: Iterable[str], timeout_secon
 				if target.rstrip("/").endswith("/generate_204"):
 					if response.status == 204 and response.geturl() == target:
 						_record_probe(target, elapsed_ms, logger)
-						return True
-					logger.debug("联网探测未返回原地址的 204：%s", target)
+						online = True
+					else:
+						logger.debug("联网探测未返回原地址的 204：%s", target)
+						latency.record_latency(target, None, False)
 					continue
 				if 200 <= getattr(response, "status", 200) < 400:
 					_record_probe(target, elapsed_ms, logger)
-					return True
+					online = True
+				else:
+					latency.record_latency(target, None, False)
 		except Exception as exc:  # noqa: BLE001
 			logger.debug("HTTP 检测失败: %s, %s", target, exc)
-	latency.record_latency("", None, False)
-	return False
+			latency.record_latency(target, None, False)
+	return online
 
 
 def _record_probe(target: str, elapsed_ms: float, logger: logging.Logger) -> None:
@@ -1343,6 +1351,8 @@ def main() -> None:
 	verbose = args.verbose or config_data.get("verbose", False)
 	
 	check_targets = args.check_target if args.check_target else config_data.get("check_targets", list(DEFAULT_CHECK_TARGETS))
+	raw_target_count = len(check_targets)
+	check_targets = list(check_targets)[:5]
 	preferred_profiles = args.preferred_profile if args.preferred_profile else config_data.get("preferred_profiles", [])
 	dns_check_hosts = config_data.get("dns_check_hosts", list(DEFAULT_DNS_HOSTS))
 
@@ -1380,6 +1390,8 @@ def main() -> None:
 	pid_file.parent.mkdir(parents=True, exist_ok=True)
 
 	logger = configure_logging(log_file, verbose, log_max_bytes, log_backup_count)
+	if raw_target_count > 5:
+		logger.warning("检测地址最多使用前 5 个，其余 %d 个已忽略。", raw_target_count - 5)
 	ensure_windows(logger)
 
 	# 单实例预检查：放在耗时的启动诊断（netsh 可能超时 10 秒）之前，

@@ -44,6 +44,37 @@ class LatencyStoreTests(unittest.TestCase):
             self.assertEqual(points[0][1], 55.0)
             self.assertEqual(len(failures), 1)
 
+    def test_read_by_target_keeps_order_and_honours_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "latency.csv"
+            now = (datetime.now() - timedelta(minutes=1)).isoformat(timespec="seconds")
+            path.write_text(
+                f"{now},https://a.example,30,1\n"
+                f"{now},https://a.example,,0\n"
+                f"{now},https://b.example,50,1\n"
+                f"{now},https://c.example,70,1\n",
+                encoding="utf-8",
+            )
+            series = latency.read_by_target(["https://a.example", "https://b.example"], path=path)
+            self.assertEqual(list(series), ["https://a.example", "https://b.example"])
+            self.assertEqual(len(series["https://a.example"]["points"]), 1)
+            self.assertEqual(series["https://a.example"]["points"][0][1], 30.0)
+            self.assertEqual(len(series["https://a.example"]["failures"]), 1)
+            self.assertEqual(series["https://b.example"]["points"][0][1], 50.0)
+            self.assertNotIn("https://c.example", series)
+
+    def test_envelope_min_and_max(self):
+        now = datetime.now()
+        series = {
+            "a": {"points": [(now, 20.0), (now + timedelta(minutes=1), 80.0)], "failures": []},
+            "b": {"points": [(now, 60.0), (now + timedelta(minutes=1), 40.0)], "failures": []},
+        }
+        lows, highs = latency.envelope(series)
+        self.assertEqual([value for _, value in lows], [20.0, 40.0])
+        self.assertEqual([value for _, value in highs], [60.0, 80.0])
+        lows_one, highs_one = latency.envelope(series, selected={"a"})
+        self.assertEqual([value for _, value in highs_one], [20.0, 80.0])
+
     def test_stats_and_svg(self):
         now = datetime.now()
         points = [(now - timedelta(minutes=2), 20.0), (now, 60.0)]
@@ -88,6 +119,41 @@ class HttpLatencyTests(unittest.TestCase):
     def setUp(self):
         self.logger = make_logger("test.latency.http")
 
+    def test_one_target_failure_does_not_mean_offline(self):
+        class FailOpener:
+            def open(self, target, timeout=None):
+                raise OSError("timeout")
+
+        class OkOpener:
+            def open(self, target, timeout=None):
+                return HttpLatencyTests._Response()
+
+        with patch("urllib.request.build_opener",
+                   side_effect=[FailOpener(), OkOpener()]), \
+             patch.object(latency, "record_latency") as record:
+            self.assertTrue(main.http_reachable(
+                self.logger, ["https://bad.example", "https://example.org"]))
+        record.assert_any_call("https://bad.example", None, False)
+        target, elapsed, ok = record.call_args_list[-1][0]
+        self.assertEqual(target, "https://example.org")
+        self.assertTrue(ok)
+        self.assertIsNotNone(main.last_latency_ms())
+
+    def test_only_first_five_targets_are_probed(self):
+        opened = []
+
+        class Opener:
+            def open(self, target, timeout=None):
+                opened.append(target)
+                raise OSError("down")
+
+        targets = [f"https://t{index}.example" for index in range(6)]
+        with patch("urllib.request.build_opener", return_value=Opener()), \
+             patch.object(latency, "record_latency") as record:
+            self.assertFalse(main.http_reachable(self.logger, targets))
+        self.assertEqual(opened, targets[:5])
+        self.assertEqual(record.call_count, 5)
+
     def test_successful_probe_records_latency(self):
         class Opener:
             def open(self, target, timeout=None):
@@ -111,7 +177,7 @@ class HttpLatencyTests(unittest.TestCase):
         with patch("urllib.request.build_opener", return_value=Opener()), \
              patch.object(latency, "record_latency") as record:
             self.assertFalse(main.http_reachable(self.logger, ["https://example.org"]))
-        record.assert_called_once_with("", None, False)
+        record.assert_called_once_with("https://example.org", None, False)
         self.assertIsNone(main.last_latency_ms())
 
 
