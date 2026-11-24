@@ -10,6 +10,13 @@
 - 图表为无额外依赖的 SVG（可直接用浏览器打开），包含平均/最高/最新延迟、失败竖线与时间轴。
 - 新增 `tests/test_latency.py`（记录、窗口过滤、SVG 内容、探测记录）。
 
+**关闭网卡节能（需管理员）**
+
+- 新增启动时自动取消「允许计算机关闭此设备以节约电源」：通过 `Disable-NetAdapterPowerManagement` 实现，等同设备管理器 → 网络适配器 → 电源管理 里的勾选项，设置会持久化。
+- 配置项 `disable_adapter_power_saving`（默认开）；GUI「守护设置」新增同名开关；命令行 `--no-adapter-power-saving` 可跳过。
+- 没有管理员权限时只记一条警告，不影响其他修复；网卡名经环境变量传入 PowerShell，不拼接脚本。
+- 新增 `tests/test_power_saving.py`。
+
 ## 0.1.0 — 2026-11-23
 
 首个正式版（Stable）。功能与 rc.3 一致，并包含针对恶意 SSID / 配置名的安全加固；建议所有 rc 用户升级。

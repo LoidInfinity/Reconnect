@@ -241,6 +241,7 @@ def save_default_config(config_file: Path) -> None:
 		"dns_check_hosts": list(DEFAULT_DNS_HOSTS),
 		"wifi_recovery": True,
 		"wifi_radio_recovery": True,
+		"disable_adapter_power_saving": True,
 		"wired_recovery": True,
 		"wired_reset_on_failure": True,
 		"adapter_reset_on_failure": True,
@@ -375,6 +376,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		"--no-wired-recovery",
 		action="store_true",
 		help="断网时不检查/修复有线连接（默认优先修复有线，再尝试无线）。",
+	)
+	parser.add_argument(
+		"--no-adapter-power-saving",
+		action="store_true",
+		help="不修改网卡节能设置（默认会取消“允许计算机关闭此设备以节约电源”，需管理员权限）。",
 	)
 	parser.add_argument("--allowed-profile", action="append", default=[], help="兼容旧版：仅允许指定 Wi-Fi 配置参与恢复，可重复。")
 	parser.add_argument("--wifi-recovery", action="store_true", help="兼容旧版：启用 Wi-Fi 恢复。")
@@ -1181,6 +1187,8 @@ def output_startup_diagnostics(args: argparse.Namespace, logger: logging.Logger)
 	logger.info("  - DNS 故障修复: %s", "启用（清空缓存 + 网卡 DNS 回退 DHCP）" if args.repair_dns else "禁用")
 	logger.info("  - Wi-Fi 重连恢复: %s", "启用" if args.wifi_recovery else "禁用（有线环境）")
 	logger.info("  - 无线电恢复: %s", "启用（无线被关闭时自动打开）" if getattr(args, "radio_recovery", True) else "禁用")
+	logger.info("  - 关闭网卡节能: %s", "启用（取消“允许计算机关闭此设备以节约电源”）"
+	            if getattr(args, "disable_adapter_power_saving", True) else "禁用")
 	logger.info("  - 失败后重置网卡: %s", "启用" if args.adapter_reset else "禁用")
 	logger.info("  - 阻止系统休眠: %s", "启用" if args.prevent_sleep else "禁用")
 	logger.info("  - 心跳间隔: %s 秒", args.heartbeat_interval)
@@ -1343,6 +1351,10 @@ def main() -> None:
 	radio_recovery = not getattr(args, "no_radio_recovery", False) and config_data.get("wifi_radio_recovery", True)
 	wired_recovery = not getattr(args, "no_wired_recovery", False) and config_data.get("wired_recovery", True)
 	wired_reset = adapter_reset and config_data.get("wired_reset_on_failure", True)
+	disable_adapter_power_saving = (
+		not getattr(args, "no_adapter_power_saving", False)
+		and config_data.get("disable_adapter_power_saving", True)
+	)
 
 	log_file = resolve_path(log_file_str)
 	log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1410,8 +1422,12 @@ def main() -> None:
 	args.adapter_reset = adapter_reset
 	args.wifi_recovery = wifi_recovery
 	args.radio_recovery = radio_recovery
+	args.disable_adapter_power_saving = disable_adapter_power_saving
 	
 	output_startup_diagnostics(args, logger)
+	
+	if args.disable_adapter_power_saving:
+		repairs.disable_adapter_power_saving(logger, args.interface)
 	
 	monitor_loop(args, logger)
 

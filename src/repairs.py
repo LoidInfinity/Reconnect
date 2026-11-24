@@ -363,6 +363,64 @@ def has_admin_privileges() -> bool:
         return False
 
 
+def disable_adapter_power_saving(logger, adapter_name: str | None = None) -> bool:
+    """Uncheck "Allow the computer to turn off this device to save power".
+
+    Uses ``Disable-NetAdapterPowerManagement`` (the same switch as the Device
+    Manager checkbox), so it needs administrator rights and persists across
+    reboots. The adapter name is passed via the environment, never spliced
+    into the script text.
+    """
+    import main as guard
+
+    if not has_admin_privileges():
+        logger.warning(
+            "关闭网卡节能需要管理员权限；请以管理员身份运行，"
+            "或运行 install_admin_task.bat 安装管理员自启任务。"
+        )
+        return False
+    if adapter_name and guard.has_unsafe_name_chars(adapter_name):
+        logger.warning("跳过名称含控制字符的网卡节能设置")
+        return False
+    script = (
+        '$ErrorActionPreference = "Stop"; '
+        "try { "
+        "  if ($env:NG_ADAPTER_NAME) { "
+        "    $targets = @(Get-NetAdapter -Name $env:NG_ADAPTER_NAME -Physical -ErrorAction Stop) "
+        "  } else { "
+        "    $targets = @(Get-NetAdapter -Physical -ErrorAction Stop | "
+        '      Where-Object { $_.InterfaceDescription -match "Wi-Fi|Wireless|WLAN|802\\.11|Ethernet" }) '
+        "  } "
+        "  if (-not $targets -or $targets.Count -eq 0) { Write-Output 'NO_ADAPTER'; exit 0 } "
+        "  foreach ($item in $targets) { "
+        "    try { "
+        "      Disable-NetAdapterPowerManagement -Name $item.Name -Confirm:$false -ErrorAction Stop; "
+        '      Write-Output ("OK:" + $item.Name) '
+        "    } catch { "
+        '      Write-Output ("ERROR:" + $item.Name + ":" + $_.Exception.Message) '
+        "    } "
+        "  } "
+        "} catch { "
+        '  Write-Output ("ERROR:" + $_.Exception.Message) '
+        "}"
+    )
+    environment = dict(os.environ)
+    environment["NG_ADAPTER_NAME"] = adapter_name or ""
+    logger.info("关闭网卡节能（取消“允许计算机关闭此设备以节约电源”）…")
+    completed = _run(["powershell", "-NoProfile", "-Command", script], logger, 40, env=environment)
+    lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    ok_names = [line[3:] for line in lines if line.startswith("OK:")]
+    errors = [line[6:] for line in lines if line.startswith("ERROR:")]
+    if "NO_ADAPTER" in lines:
+        logger.debug("未找到可设置节能选项的网卡")
+        return False
+    if ok_names:
+        logger.info("✓ 已关闭网卡节能: %s", "、".join(ok_names))
+    for error in errors:
+        logger.warning("关闭网卡节能失败: %s", error)
+    return bool(ok_names) and not errors
+
+
 def renew_dhcp(logger, interface_name: str, reason: list[str] | None = None) -> bool:
     """Release/renew the lease so an APIPA address can be replaced.
 

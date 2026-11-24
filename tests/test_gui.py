@@ -22,6 +22,11 @@ class SettingsTests(unittest.TestCase):
         gui.save_settings(self.path, gui.validate_settings(self.config))
         self.assertEqual(gui.read_settings(self.path), self.config)
 
+    def test_adapter_power_saving_defaults_on(self):
+        self.assertTrue(self.config["disable_adapter_power_saving"])
+        with self.assertRaises(ValueError):
+            gui.validate_settings(dict(self.config, disable_adapter_power_saving="yes"))
+
     def test_control_characters_are_rejected(self):
         for change in (dict(interface="WLAN\nx"), dict(preferred_profiles=["a\nb"]),
                        dict(disabled_profiles=["a\x1bb"]), dict(dns_reset_interfaces=["x\ry"])):
@@ -410,7 +415,7 @@ class WindowTests(unittest.TestCase):
                 self.assertFalse(gui.wheel_scrolls_container(app.log_text))
                 self.assertTrue(gui.wheel_scrolls_container(app.notice))
                 # 设置项使用带对勾的原生复选框，而不是 clam 主题的 X 形
-                self.assertEqual(len(app.switch_buttons), 7)
+                self.assertEqual(len(app.switch_buttons), 8)
                 for button in app.switch_buttons:
                     self.assertIsInstance(button, tk.Checkbutton)
                     self.assertNotIsInstance(button, gui.ttk.Checkbutton)
