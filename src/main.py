@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import repairs
+import latency
 from app_info import (DATA_DIR, LOG_DIR, LOG_NAME, LOG_SUBPATH, VERSION,
                       clear_internet_marks_async, migrate_legacy_layout)
 
@@ -59,6 +60,7 @@ _NETWORK_FIELD_RE = re.compile(
 	r"(?i)\b(SSID|AP BSSID|BSSID|Profile|配置文件|物理地址)\s*[:：]\s*[^|\n]*"
 )
 _DATACLASS_FIELD_RE = re.compile(r"(?i)\b(ssid|bssid|profile)='[^']*'")
+_PROFILE_LINE_RE = re.compile(r"(所有用户配置文件\s*:\s*)([^|]+)")
 
 
 def redact(text: str) -> str:
@@ -72,6 +74,14 @@ def redact(text: str) -> str:
 		return ""
 	text = _GUID_RE.sub("<guid>", text)
 	text = _MAC_RE.sub("<mac>", text)
+
+	def _mask_profile_line(match: re.Match) -> str:
+		name = match.group(2).strip()
+		if name in ("<无>", "<none>", ""):
+			return match.group(0)
+		return f"{match.group(1)}<profile>"
+
+	text = _PROFILE_LINE_RE.sub(_mask_profile_line, text)
 	text = _NETWORK_FIELD_RE.sub(lambda match: f"{match.group(1)}: <redacted>", text)
 	text = _DATACLASS_FIELD_RE.sub(lambda match: f"{match.group(1)}='<redacted>'", text)
 	return text
@@ -125,6 +135,16 @@ class SafeFormatter(logging.Formatter):
 
 	def format(self, record: logging.LogRecord) -> str:
 		return _ANSI_ESCAPE_RE.sub("", super().format(record)).replace("\r", "")
+
+
+# Result of the last successful HTTP probe, shown in per-cycle logs and used by
+# the latency chart window.
+_last_probe: dict[str, Any] = {"ms": None, "target": None, "at": None}
+
+
+def last_latency_ms() -> float | None:
+	value = _last_probe.get("ms")
+	return float(value) if isinstance(value, (int, float)) else None
 
 
 @dataclass(frozen=True)
@@ -387,6 +407,12 @@ def configure_logging(log_file: Path, verbose: bool, max_bytes: int = 2 * 1024 *
 	file_handler.setFormatter(formatter)
 
 	console_handler = logging.StreamHandler(sys.stdout)
+	# Windows 控制台默认 GBK，日志里的符号/emoji 会触发 UnicodeEncodeError；
+	# 保留原编码，只把无法编码的字符替换掉，避免整行日志丢失。
+	try:
+		sys.stdout.reconfigure(errors="replace")
+	except (AttributeError, ValueError):
+		pass
 	console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
 	console_handler.setFormatter(formatter)
 
@@ -708,25 +734,39 @@ def ping_reachable(logger: logging.Logger, timeout_seconds: int = 2) -> bool:
 
 
 def http_reachable(logger: logging.Logger, targets: Iterable[str], timeout_seconds: int = 4) -> bool:
-	"""应用层是否通。每次新建 opener，避免缓存住旧的系统代理设置。"""
+	"""应用层是否通。每次新建 opener，避免缓存住旧的系统代理设置。
+
+	成功的探测会把往返延迟写入 ``data/latency.csv``，供控制台展示与折线图使用。
+	"""
 	import urllib.request
 
+	_last_probe.update(ms=None, target=None, at=None)
 	for target in targets:
+		started = time.perf_counter()
 		try:
 			opener = urllib.request.build_opener()
 			with opener.open(target, timeout=timeout_seconds) as response:
+				elapsed_ms = (time.perf_counter() - started) * 1000
 				# Dedicated 204 endpoints must not accept a portal/login page as online.
 				if target.rstrip("/").endswith("/generate_204"):
 					if response.status == 204 and response.geturl() == target:
+						_record_probe(target, elapsed_ms, logger)
 						return True
 					logger.debug("联网探测未返回原地址的 204：%s", target)
 					continue
 				if 200 <= getattr(response, "status", 200) < 400:
-					logger.debug("HTTP 检测成功: %s", target)
+					_record_probe(target, elapsed_ms, logger)
 					return True
 		except Exception as exc:  # noqa: BLE001
 			logger.debug("HTTP 检测失败: %s, %s", target, exc)
+	latency.record_latency("", None, False)
 	return False
+
+
+def _record_probe(target: str, elapsed_ms: float, logger: logging.Logger) -> None:
+	_last_probe.update(ms=elapsed_ms, target=target, at=time.time())
+	latency.record_latency(target, elapsed_ms, True)
+	logger.debug("HTTP 检测成功: %s (%d ms)", target, elapsed_ms)
 
 
 def is_internet_reachable(logger: logging.Logger, targets: Iterable[str], timeout_seconds: int = 4) -> bool:
@@ -1132,7 +1172,7 @@ def output_startup_diagnostics(args: argparse.Namespace, logger: logging.Logger)
 	profiles = get_saved_profiles(logger)
 	if profiles:
 		for i, profile in enumerate(profiles, 1):
-			logger.info("  %d. %s", i, profile)
+			logger.info("  %d. %s", i, mask_profile(profile))
 	else:
 		logger.warning("  - 未找到任何已保存的 Wi-Fi 配置")
 	
@@ -1192,6 +1232,8 @@ def monitor_loop(args: argparse.Namespace, logger: logging.Logger) -> None:
 
 			online = is_internet_reachable(logger, check_targets)
 			if online:
+				latency_text = f"{last_latency_ms():.0f} ms" if last_latency_ms() is not None else "未知"
+				logger.info("本轮检测：网络可用 · 延迟 %s", latency_text)
 				if last_online is not True:
 					logger.info("网络状态恢复为正常。")
 				last_online = True

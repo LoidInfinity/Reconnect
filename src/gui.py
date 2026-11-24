@@ -231,7 +231,9 @@ def _monitor_worker(config_path, config, logger):
         try:
             now = time.monotonic()
             if now - last_heartbeat >= config["heartbeat_interval"]:
-                logger.info("心跳：守护运行中，恢复成功 %d/%d", successes, attempts)
+                last_latency = guard.last_latency_ms()
+                logger.info("心跳：守护运行中，恢复成功 %d/%d · 最近延迟 %s", successes, attempts,
+                            f"{last_latency:.0f} ms" if last_latency is not None else "未知")
                 for handler in logger.handlers:
                     handler.flush()
                 last_heartbeat = now
@@ -267,7 +269,12 @@ def _monitor_worker(config_path, config, logger):
             interfaces = guard.get_wifi_interfaces(logger, config["interface"])
             emit("result", online=online, attempts=attempts, successes=successes, **repair_stats,
                  interfaces=[vars(item) for item in interfaces], checked=time.strftime("%H:%M:%S"))
-            logger.info("本轮检测：%s", "网络可用" if online else "网络不可用")
+            latency_value = guard.last_latency_ms()
+            if online:
+                logger.info("本轮检测：网络可用 · 延迟 %s",
+                            f"{latency_value:.0f} ms" if latency_value is not None else "未知")
+            else:
+                logger.info("本轮检测：网络不可用")
         except Exception:
             logger.exception("检测发生异常，将在下一轮重试")
             emit("status", text="检测异常 · 请查看日志", tone="error")
@@ -595,6 +602,7 @@ class GuardApp:
         toolbar.pack(fill="x", pady=(0, 8))
         ttk.Label(toolbar, text="实时输出 · 最多显示 1500 行", foreground=MUTED).pack(side="left")
         ttk.Button(toolbar, text="清空显示", command=self.clear_logs).pack(side="right")
+        ttk.Button(toolbar, text="延迟折线图", command=self.show_latency_chart).pack(side="right", padx=(0, 8))
         self.log_text = tk.Text(logs, bg="#102139", fg="#d6e2f3", font=("Consolas", 10),
                                 width=24, height=10, wrap="word", relief="flat", state="disabled")
         scroll = ttk.Scrollbar(logs, command=self.log_text.yview)
@@ -981,6 +989,22 @@ class GuardApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+
+    def show_latency_chart(self):
+        """Generate the latency SVG chart and open it in the default viewer."""
+        try:
+            chart = guard.latency.write_chart()
+        except OSError as exc:
+            self.notice.configure(text=f"生成延迟折线图失败：{exc}")
+            return
+        points, failures = guard.latency.read_series()
+        self.notice.configure(
+            text=f"延迟折线图已生成：{chart.name}（成功 {len(points)} 次，失败 {len(failures)} 次）"
+        )
+        try:
+            os.startfile(chart)  # type: ignore[attr-defined]
+        except OSError:
+            pass
 
     def open_support(self):
         """Open the problem-report dialog: bundle logs or open the log folder."""

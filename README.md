@@ -6,7 +6,7 @@
 
 Windows 断网自动恢复工具：定时检测网络，断了按“从轻到重”自动修复有线和无线连接。
 
-当前版本 **0.1.0** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md) · [安全说明](docs/SECURITY.md)
+当前版本 **0.2.0-alpha.1** · [更新记录](CHANGELOG.md) · [与初始脚本对照](docs/LEGACY_REVIEW.md) · [安全说明](docs/SECURITY.md)
 
 ## 安装版（Setup.exe）
 
@@ -115,12 +115,26 @@ Get-ChildItem -Path "D:\NetworkGuard" -Recurse | Unblock-File
 - **命令超时** — 子进程卡死时由守护线程限时放弃等待，主循环不会被拖死。
 - **休眠 / 崩溃检测** — 休眠后立即重置状态重新检测；启动时若发现残留 PID 文件，会回放上次会话最后 15 行日志（带 `[上次]` 标记，不会混入本次启动的日志）。
 
+## 延迟监控与折线图
+
+每一轮 HTTP 检测都会记录往返延迟，并在日志里显示：
+
+```
+本轮检测：网络可用 · 延迟 45 ms
+心跳：守护运行中，恢复成功 1/2 · 最近延迟 52 ms
+```
+
+- 数据保存在 `data\latency.csv`（成功记录延迟，失败记录为标记行；超过 2 MB 自动裁剪）。
+- **界面**：运行日志页点「延迟折线图」，生成 SVG 并用默认浏览器打开。
+- 图表包含平均/最高/最新延迟、失败时刻红色竖线与时间轴；SVG 无需额外依赖，可直接发给他人或插入文档。
+
 ## 仓库结构
 
 ```
 src/
   gui.py / main.py                   GUI 与 CLI 两个入口
   repairs.py                         网络修复动作（DNS、代理、有线、Wi-Fi、网卡重置）
+  latency.py                         延迟记录与 SVG 折线图
   updates.py                         检查 GitHub Release 更新
   app_info.py                        版本号与可写数据目录
   build.py                           PyInstaller + Inno Setup 打包脚本
@@ -136,7 +150,7 @@ install_admin_task.bat / enable_wlan.bat   开机自启 / 手动启用无线网�
 requirements-build.txt / CHANGELOG.md / LICENSE
 ```
 
-运行时自动生成的全部内容都收在 `data/`（配置、状态、PID，以及 `data\logs\` 下的日志），不会弄脏项目目录，也不入库；同理不入库的还有 `dist/`、`build/`、`.vscode/`、`*.code-workspace`。
+运行时自动生成的全部内容都收在 `data/`（配置、状态、PID、`latency.csv` 延迟记录与 `charts/` 折线图，以及 `data\logs\` 下的日志），不会弄脏项目目录，也不入库；同理不入库的还有 `dist/`、`build/`、`.vscode/`、`*.code-workspace`。
 
 ## 构建与测试
 
@@ -157,8 +171,8 @@ python src/build.py                                        # 目录 + ZIP + 安�
 改好 `src/app_info.py` 里的 `VERSION` 与 `CHANGELOG.md`，提交后打标签推送：
 
 ```powershell
-git tag -a v0.1.0 -m "0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0-alpha.1 -m "0.2.0-alpha.1"
+git push origin v0.2.0-alpha.1
 ```
 
 `.github/workflows/release.yml` 会在 **推送 `v*` 标签时自动**触发：跑测试、校验标签与版本一致、构建 ZIP 与安装包、生成 SHA-256，并创建 **预发行** Release（标签中含 `-beta`、`-alpha`、`-rc` 即判定为预发行）。标签必须与 `VERSION` 完全一致，否则工作流直接失败。程序内置的“检查 GitHub 更新”依赖这个 Release，只推送代码不算发布。
@@ -169,7 +183,7 @@ git push origin v0.1.0
 - **已保存的 Wi-Fi** — 刷新配置与网卡状态，将所选配置设为首选；不读取也不展示 Wi-Fi 密码。点击表头可按名称/优先顺序/参与状态排序（再点反向）；「优先顺序」列显示 1…N；「按当前顺序设为优先」把列表当前顺序写回首选配置。「从列表移除未选定的」只在本软件的列表里隐藏未勾选的配置（Windows 中仍保留，密码不受影响），可用「恢复已隐藏」找回；隐藏名单保存在 `config\hidden_wifi.txt`，已加入 `.gitignore`。
 - **参与恢复开关** — 只有勾选的配置参与重连；新发现的配置默认不参与，全部关闭时不会发起连接。选择保存于 `enabled_profiles`。
 - **守护设置** — 检测间隔、重连超时、网卡、首选配置、检测地址、六类修复开关、防休眠。运行中修改需重启守护才生效。
-- **运行日志** — 实时输出；“清空显示”只清界面，不删磁盘日志。
+- **运行日志** — 实时输出；“清空显示”只清界面，不删磁盘日志；“延迟折线图”按最近 24 小时数据生成 SVG 并打开。
 - **主界面不滚动** — 窗口按内容自适应，打开时即保证全部内容可见；设置页在极小窗口或高 DPI 下才会出现页内滚动条，列表与日志各自保留自己的滚动。
 - **遇到问题** — 左侧栏按钮，弹出反馈窗口：显示将生成的压缩包名，可一键「打包日志」或「打开日志文件夹」。
 

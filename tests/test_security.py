@@ -49,6 +49,12 @@ class NameSanitizerTests(unittest.TestCase):
         self.assertEqual(masked, main.mask_profile("SecretCafe"))
         self.assertNotEqual(masked, main.mask_profile("OtherCafe"))
 
+    def test_netsh_profile_list_is_redacted(self):
+        text = main.redact("所有用户配置文件 : SecretCafe | 所有用户配置文件 : <无>")
+        self.assertNotIn("SecretCafe", text)
+        self.assertIn("<profile>", text)
+        self.assertIn("<无>", text)
+
     def test_formatter_strips_ansi_and_carriage_returns(self):
         formatter = main.SafeFormatter("%(message)s")
         record = logging.LogRecord("x", logging.INFO, "", 0, "ssid \x1b[2J\rnext", None, None)

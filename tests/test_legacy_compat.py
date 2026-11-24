@@ -65,7 +65,8 @@ class ProbeTests(unittest.TestCase):
                 manager.__exit__ = Mock(return_value=False)
                 opener = Mock()
                 opener.open.return_value = manager
-                with patch("urllib.request.build_opener", return_value=opener):
+                with patch("urllib.request.build_opener", return_value=opener), \
+                     patch.object(main.latency, "record_latency"):
                     self.assertEqual(main.http_reachable(logging.getLogger("test"), [target]), expected)
 
 
