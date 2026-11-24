@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import sys
 
-VERSION = "0.2.0-alpha.3"
+VERSION = "0.2.0-alpha.4"
 REPOSITORY = "LoidInfinity/Reconnect"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 FROZEN = bool(getattr(sys, "frozen", False))
