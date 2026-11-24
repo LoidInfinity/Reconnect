@@ -58,3 +58,6 @@ tests.log
 
 # GUI 隐藏的 Wi-Fi 名单（含个人网络名，禁止提交）
 /config/hidden_wifi.txt
+
+# 日志分析报告（可能含外部用户网络信息，不入库）
+/reports/
