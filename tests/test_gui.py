@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 import os
 from pathlib import Path
 import tempfile
@@ -428,6 +429,16 @@ class WindowTests(unittest.TestCase):
                 self.assertEqual(app.update_channel.get(), "稳定版")
                 self.assertEqual(list(app.update_channel_combo.cget("values")),
                                  ["稳定版", "公测版", "内测版"])
+                with patch.object(gui.guard.latency, "read_series",
+                                  return_value=([(datetime.now(), 30.0), (datetime.now(), 45.0)], [])), \
+                     patch.object(gui.guard.latency, "write_chart") as write_chart:
+                    app.show_latency_chart()
+                    app.root.update_idletasks()
+                    window = app._latency_window
+                    self.assertIsNotNone(window)
+                    self.assertGreater(len(window.canvas.find_all()), 0)
+                    window.destroy()
+                    write_chart.assert_not_called()
             finally:
                 for timer in root.tk.call("after", "info"):
                     root.after_cancel(timer)

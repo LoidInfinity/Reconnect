@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
@@ -303,6 +304,146 @@ def apply_window_icon(window) -> None:
             window.iconbitmap(default=str(icon))
     except Exception:  # noqa: BLE001 - a missing icon must never block startup
         pass
+
+
+class LatencyChartWindow(tk.Toplevel):
+    """Latency line chart drawn directly on a Tk canvas.
+
+    The chart is part of the app (no SVG file, no browser): the canvas redraws
+    on resize, and an optional "保存 SVG" button exports a copy for sharing.
+    """
+
+    HOURS = 24
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("网络延迟")
+        self.configure(bg=BG)
+        self.geometry("960x500")
+        self.minsize(680, 380)
+        self.transient(parent)
+        apply_window_icon(self)
+
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=16, pady=(12, 8))
+        ttk.Label(header, text="网络延迟", font=("Microsoft YaHei UI", 15, "bold"),
+                  foreground=INK).pack(side="left")
+        self.stats = ttk.Label(header, text="", foreground=MUTED)
+        self.stats.pack(side="left", padx=(12, 0))
+        ttk.Button(header, text="关闭", command=self.destroy).pack(side="right")
+        ttk.Button(header, text="保存 SVG", command=self.save_svg).pack(side="right", padx=(0, 8))
+        ttk.Button(header, text="刷新", command=self.refresh).pack(side="right", padx=(0, 8))
+
+        self.canvas = tk.Canvas(self, bg="white", highlightthickness=1,
+                                highlightbackground="#dbe4f0")
+        self.canvas.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.canvas.bind("<Configure>", self._on_resize)
+        self._resize_job = None
+        self.points: list[tuple[datetime, float]] = []
+        self.failures: list[datetime] = []
+        self.refresh()
+
+    def _on_resize(self, event=None):
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(120, self.redraw)
+
+    def destroy(self):
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except tk.TclError:
+                pass
+            self._resize_job = None
+        super().destroy()
+
+    def refresh(self):
+        self.points, self.failures = guard.latency.read_series(hours=self.HOURS)
+        summary = guard.latency.stats(self.points)
+        if self.points:
+            self.stats.configure(
+                text=(f"最近 {self.HOURS} 小时 · 样本 {summary['count']} · "
+                      f"平均 {summary['avg']:.0f} ms · 最高 {summary['max']:.0f} ms · "
+                      f"最新 {summary['last']:.0f} ms · 失败 {len(self.failures)} 次"))
+        else:
+            self.stats.configure(text=f"最近 {self.HOURS} 小时 · 暂无数据")
+        self.redraw()
+
+    def save_svg(self):
+        try:
+            path = guard.latency.write_chart(hours=self.HOURS)
+        except OSError as exc:
+            self.stats.configure(text=f"导出失败：{exc}")
+            return
+        self.stats.configure(text=f"已保存 SVG：{path.name}")
+
+    def redraw(self):
+        self._resize_job = None
+        canvas = self.canvas
+        canvas.delete("all")
+        width = max(320, canvas.winfo_width())
+        height = max(240, canvas.winfo_height())
+        left, right, top, bottom = 64, 26, 28, 58
+        plot_w = max(10, width - left - right)
+        plot_h = max(10, height - top - bottom)
+        baseline = top + plot_h
+
+        if self.points:
+            summary = guard.latency.stats(self.points)
+            y_max = max(10.0, summary["max"] * 1.15)
+            first, last = self.points[0][0], self.points[-1][0]
+        else:
+            y_max = 100.0
+            last = datetime.now()
+            first = last - timedelta(hours=self.HOURS)
+        span = max(1.0, (last - first).total_seconds())
+
+        def x_of(stamp):
+            return left + min(1.0, max(0.0, (stamp - first).total_seconds() / span)) * plot_w
+
+        def y_of(value):
+            return top + (1 - min(1.0, max(0.0, value / y_max))) * plot_h
+
+        for step in range(5):
+            value = y_max * step / 4
+            y = y_of(value)
+            canvas.create_line(left, y, left + plot_w, y, fill="#e2e8f0")
+            canvas.create_text(left - 10, y, text=f"{value:.0f}", anchor="e",
+                               fill=MUTED, font=("Microsoft YaHei UI", 9))
+        canvas.create_text(left - 46, top - 10, text="ms", anchor="w", fill=MUTED,
+                           font=("Microsoft YaHei UI", 9))
+        canvas.create_line(left, baseline, left + plot_w, baseline, fill="#334155", width=2)
+        canvas.create_line(left, top, left, baseline, fill="#334155", width=2)
+
+        for index in range(5):
+            stamp = first + timedelta(seconds=span * index / 4)
+            anchor = "w" if index == 0 else ("e" if index == 4 else "center")
+            canvas.create_text(left + plot_w * index / 4, baseline + 18, anchor=anchor,
+                               text=stamp.strftime("%m-%d %H:%M"), fill=MUTED,
+                               font=("Microsoft YaHei UI", 9))
+
+        if self.points:
+            coords = []
+            for stamp, value in self.points:
+                coords.extend((x_of(stamp), y_of(value)))
+            area = [left, baseline] + coords + [left + plot_w, baseline]
+            canvas.create_polygon(area, fill="#eaf2ff", outline="")
+            canvas.create_line(*coords, fill="#2563eb", width=2)
+            last_x, last_y = coords[-2], coords[-1]
+            canvas.create_oval(last_x - 4, last_y - 4, last_x + 4, last_y + 4,
+                               fill="#2563eb", outline="")
+        else:
+            canvas.create_text(left + plot_w / 2, top + plot_h / 2,
+                               text="暂无延迟数据\n让守护运行几分钟后再打开",
+                               fill="#94a3b8", font=("Microsoft YaHei UI", 12), justify="center")
+
+        for stamp in self.failures[:300]:
+            x = x_of(stamp)
+            canvas.create_line(x, baseline - 8, x, baseline, fill="#dc2626", width=3)
+
+        canvas.create_text(left, height - 12, anchor="w", fill="#94a3b8",
+                           text="蓝色：HTTP 往返延迟    红色：检测失败",
+                           font=("Microsoft YaHei UI", 9))
 
 
 class GuardApp:
@@ -1015,20 +1156,14 @@ class GuardApp:
         self.log_text.configure(state="disabled")
 
     def show_latency_chart(self):
-        """Generate the latency SVG chart and open it in the default viewer."""
-        try:
-            chart = guard.latency.write_chart()
-        except OSError as exc:
-            self.notice.configure(text=f"生成延迟折线图失败：{exc}")
+        """Open the in-app latency chart window (drawn on a Tk canvas)."""
+        window = getattr(self, "_latency_window", None)
+        if window is not None and window.winfo_exists():
+            window.refresh()
+            window.lift()
+            window.focus_set()
             return
-        points, failures = guard.latency.read_series()
-        self.notice.configure(
-            text=f"延迟折线图已生成：{chart.name}（成功 {len(points)} 次，失败 {len(failures)} 次）"
-        )
-        try:
-            os.startfile(chart)  # type: ignore[attr-defined]
-        except OSError:
-            pass
+        self._latency_window = LatencyChartWindow(self.root)
 
     def open_support(self):
         """Open the problem-report dialog: bundle logs or open the log folder."""
