@@ -33,6 +33,14 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gui.validate_settings(dict(self.config, update_channel="nightly"))
 
+    def test_update_startup_defaults(self):
+        self.assertTrue(self.config["check_updates_on_startup"])
+        self.assertEqual(self.config["skipped_update"], "")
+        with self.assertRaises(ValueError):
+            gui.validate_settings(dict(self.config, check_updates_on_startup="yes"))
+        with self.assertRaises(ValueError):
+            gui.validate_settings(dict(self.config, skipped_update=5))
+
     def test_control_characters_are_rejected(self):
         for change in (dict(interface="WLAN\nx"), dict(preferred_profiles=["a\nb"]),
                        dict(disabled_profiles=["a\x1bb"]), dict(dns_reset_interfaces=["x\ry"])):
@@ -421,7 +429,7 @@ class WindowTests(unittest.TestCase):
                 self.assertFalse(gui.wheel_scrolls_container(app.log_text))
                 self.assertTrue(gui.wheel_scrolls_container(app.notice))
                 # 设置项使用带对勾的原生复选框，而不是 clam 主题的 X 形
-                self.assertEqual(len(app.switch_buttons), 8)
+                self.assertEqual(len(app.switch_buttons), 9)
                 for button in app.switch_buttons:
                     self.assertIsInstance(button, tk.Checkbutton)
                     self.assertNotIsInstance(button, gui.ttk.Checkbutton)
@@ -439,6 +447,18 @@ class WindowTests(unittest.TestCase):
                     self.assertGreater(len(window.canvas.find_all()), 0)
                     window.destroy()
                     write_chart.assert_not_called()
+
+                class FakeDialog:
+                    def __init__(self, *args, **kwargs):
+                        self.choice = "skip"
+
+                with patch.object(gui, "FROZEN", True), \
+                     patch.object(gui.updater, "install_mode", return_value="portable"), \
+                     patch.object(gui, "UpdatePromptDialog", FakeDialog):
+                    app._handle_update_result(
+                        dict(available=True, latest="v9.9.9", channel="alpha", assets=[]),
+                        startup=False)
+                self.assertEqual(gui.read_settings(app.config_path)["skipped_update"], "v9.9.9")
             finally:
                 for timer in root.tk.call("after", "info"):
                     root.after_cancel(timer)

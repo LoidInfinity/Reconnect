@@ -61,12 +61,13 @@ def select_release(releases: list, current: str = VERSION, channel: str | None =
             continue
         if not channel_allows(key, channel):
             continue
-        candidates.append((key, tag))
+        candidates.append((key, tag, release))
     if not candidates:
         return dict(available=False, latest=None, url=RELEASES_URL, channel=channel)
-    key, tag = max(candidates)
+    key, tag, release = max(candidates, key=lambda item: item[0])
     return dict(available=key > current_key, latest=tag,
-                url=RELEASES_URL + "/tag/" + quote(tag, safe=""), channel=channel)
+                url=RELEASES_URL + "/tag/" + quote(tag, safe=""), channel=channel,
+                assets=list(release.get("assets") or []))
 
 
 def check_updates(current: str = VERSION, channel: str | None = None):

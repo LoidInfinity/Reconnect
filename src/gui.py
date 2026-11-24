@@ -22,6 +22,7 @@ from tkinter import font as tkfont
 from urllib.parse import urlparse
 
 import main as guard
+import updater
 from app_info import (VERSION, APP_DIR, DATA_DIR, FROZEN, worker_command, resource_path,
                      hidden_profiles_path)
 from updates import CHANNEL_LABELS, CHANNELS, check_updates
@@ -98,7 +99,8 @@ def read_settings(path: Path) -> dict:
                     repair_dns_on_failure=True, dns_check_hosts=list(guard.DEFAULT_DNS_HOSTS), dns_reset_interfaces=[],
                     wired_recovery=True, wired_reset_on_failure=True,
                     wifi_recovery=True, wifi_radio_recovery=True, adapter_reset_on_failure=True,
-                    disable_adapter_power_saving=True, update_channel="stable")
+                    disable_adapter_power_saving=True, update_channel="stable",
+                    check_updates_on_startup=True, skipped_update="")
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
@@ -126,7 +128,7 @@ def validate_settings(data: dict) -> dict:
     for key in ("prevent_sleep", "cleanup_proxy_on_disconnect", "repair_dns_on_failure",
                 "wired_recovery", "wired_reset_on_failure",
                 "wifi_recovery", "wifi_radio_recovery", "adapter_reset_on_failure",
-                "disable_adapter_power_saving"):
+                "disable_adapter_power_saving", "check_updates_on_startup"):
         if not isinstance(data.get(key, True), bool):
             raise ValueError(f"{key} 必须是 true 或 false")
         result[key] = data.get(key, True)
@@ -154,6 +156,10 @@ def validate_settings(data: dict) -> dict:
     if channel not in CHANNELS:
         raise ValueError("更新渠道必须是 stable、beta 或 alpha")
     result["update_channel"] = channel
+    skipped = data.get("skipped_update", "")
+    if not isinstance(skipped, str):
+        raise ValueError("skipped_update 必须是文字")
+    result["skipped_update"] = skipped
     for key in ("log_file", "state_file", "pid_file"):
         if not isinstance(data[key], str) or not data[key].strip():
             raise ValueError(f"{key} 不能为空")
@@ -446,6 +452,128 @@ class LatencyChartWindow(tk.Toplevel):
                            font=("Microsoft YaHei UI", 9))
 
 
+class UpdatePromptDialog(tk.Toplevel):
+    """Ask whether to download, postpone, or skip the offered release."""
+
+    def __init__(self, parent, version, channel, startup):
+        super().__init__(parent)
+        self.title("发现新版本")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.choice = "later"
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"发现新版本 {version}", font=("Microsoft YaHei UI", 14, "bold"),
+                  foreground=INK).pack(anchor="w")
+        ttk.Label(body, text=f"更新通道：{channel}", foreground=MUTED).pack(anchor="w", pady=(2, 10))
+        message = ("程序会在后台下载更新包并校验 SHA-256，完成后退出、安装到原目录并自动重启。\n"
+                   "配置、日志和 Wi-Fi 名单都会保留。")
+        if startup:
+            message += "\n\n不想每次启动都提示，可在「守护设置」关闭“启动时检查更新”。"
+        ttk.Label(body, text=message, wraplength=430, justify="left").pack(anchor="w")
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(16, 0))
+
+        def choose(value):
+            self.choice = value
+            self.destroy()
+
+        ttk.Button(buttons, text="立即更新", command=lambda: choose("install")).pack(side="right")
+        ttk.Button(buttons, text="稍后", command=lambda: choose("later")).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="跳过此版本", command=lambda: choose("skip")).pack(side="right", padx=(0, 8))
+        apply_window_icon(self)
+        self.grab_set()
+        self.wait_window()
+
+
+class UpdateDownloadWindow(tk.Toplevel):
+    """Download + verify progress, then hand off to the apply helper."""
+
+    def __init__(self, app, result):
+        super().__init__(app.root)
+        self.app = app
+        self.result = result
+        self.mode = updater.install_mode()
+        self.workdir = updater.new_workdir()
+        self.cancelled = False
+        self.finished = False
+        self.queue = queue.Queue()
+        self.title("正在下载更新")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(app.root)
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"正在更新到 {result.get('latest', '')}",
+                  font=("Microsoft YaHei UI", 13, "bold"), foreground=INK).pack(anchor="w")
+        self.status = ttk.Label(body, text="准备下载…", foreground=MUTED)
+        self.status.pack(anchor="w", pady=(4, 10))
+        self.bar = ttk.Progressbar(body, mode="determinate", maximum=100, length=420)
+        self.bar.pack(fill="x")
+        self.cancel_button = ttk.Button(body, text="取消", command=self.cancel)
+        self.cancel_button.pack(anchor="e", pady=(12, 0))
+        apply_window_icon(self)
+        threading.Thread(target=self._worker, daemon=True).start()
+        self.after(100, self._poll)
+
+    def cancel(self):
+        self.cancelled = True
+        self.cancel_button.configure(state="disabled", text="正在取消…")
+
+    def destroy(self):
+        # Closing the window (X) must also stop the worker and avoid callbacks
+        # touching destroyed widgets.
+        self.finished = True
+        self.cancelled = True
+        super().destroy()
+
+    def _worker(self):
+        try:
+            package = updater.fetch_update(
+                self.result, self.mode, self.workdir,
+                progress=lambda done, total: self.queue.put(("progress", done, total)),
+                cancelled=lambda: self.cancelled)
+            self.queue.put(("done", package))
+        except updater.UpdateCancelled:
+            self.queue.put(("cancelled", None))
+        except Exception as exc:  # noqa: BLE001 - surfaced in the dialog
+            self.queue.put(("error", str(exc)))
+
+    def _poll(self):
+        try:
+            while True:
+                item = self.queue.get_nowait()
+                kind = item[0]
+                if kind == "progress":
+                    done, total = item[1], item[2]
+                    if total:
+                        self.bar["value"] = min(100, done * 100 / total)
+                        self.status.configure(
+                            text=f"正在下载… {done / 1048576:.1f} / {total / 1048576:.1f} MB")
+                    else:
+                        self.status.configure(text=f"正在下载… {done / 1048576:.1f} MB")
+                elif kind == "done":
+                    self.finished = True
+                    self.destroy()
+                    self.app.install_downloaded(item[1], self.mode, self.workdir)
+                    return
+                elif kind == "cancelled":
+                    self.finished = True
+                    self.destroy()
+                    self.app.notice.configure(text="已取消更新")
+                    return
+                elif kind == "error":
+                    self.finished = True
+                    self.destroy()
+                    messagebox.showerror("更新失败", item[1], parent=self.app.root)
+                    return
+        except queue.Empty:
+            pass
+        if not self.finished:
+            self.after(100, self._poll)
+
+
 class GuardApp:
     def __init__(self, root: tk.Tk, config_path: Path):
         self.root, self.config_path = root, config_path
@@ -503,6 +631,9 @@ class GuardApp:
 
         self._map_binding = self.root.bind("<Map>", fit_after_map, add="+")
         self.root.after(100, self.poll)
+        updater.cleanup_workdirs()
+        if FROZEN and self.config.get("check_updates_on_startup", True):
+            self.root.after(3000, lambda: self.check_for_updates(startup=True))
         if self.config_error:
             self.root.after(200, lambda: messagebox.showwarning("配置读取失败", self.config_error + "\n已载入默认值；保存将覆盖原配置。"))
         self.refresh()
@@ -715,6 +846,7 @@ class GuardApp:
             ("wifi_recovery", "再重连已保存的 Wi-Fi（有线恢复不了才走这一步）"),
             ("wifi_radio_recovery", "无线被关闭时自动打开无线电（飞行模式/Wi-Fi 开关被关）"),
             ("disable_adapter_power_saving", "关闭网卡节能（取消“允许计算机关闭此设备”，需管理员）"),
+            ("check_updates_on_startup", "启动时检查更新（发现新版本可在程序内下载安装）"),
             ("adapter_reset_on_failure", "全部失败后禁用/启用网卡（需管理员权限）"),
             ("prevent_sleep", "守护期间阻止系统休眠"),
         )):
@@ -1103,18 +1235,70 @@ class GuardApp:
             self.events.put((generation, dict(kind="exit", code=process.wait())))
         threading.Thread(target=read_output, daemon=True).start()
 
-    def check_for_updates(self):
+    def check_for_updates(self, startup=False):
         if self.checking_updates:
             return
         self.checking_updates = True
-        self.update_button.configure(state="disabled", text="正在检查…")
+        if not startup:
+            self.update_button.configure(state="disabled", text="正在检查…")
+
         def task():
             try:
                 channel = UPDATE_LABEL_TO_CHANNEL.get(self.update_channel.get(), "stable")
-                self.events.put((None, dict(kind="update", result=check_updates(channel=channel))))
+                self.events.put((None, dict(kind="update", result=check_updates(channel=channel),
+                                            startup=startup)))
             except Exception as exc:
-                self.events.put((None, dict(kind="update", error=str(exc))))
+                self.events.put((None, dict(kind="update", error=str(exc), startup=startup)))
+
         threading.Thread(target=task, daemon=True).start()
+
+    def _handle_update_result(self, result, startup):
+        if not result.get("available"):
+            if not startup:
+                text = ("仓库尚未发布可识别的版本。" if result.get("latest") is None
+                        else "当前已是最新版本。")
+                messagebox.showinfo("检查更新", f"当前版本：{VERSION}\n{text}", parent=self.root)
+            return
+        if startup and result.get("latest") == self.config.get("skipped_update"):
+            return
+        channel = CHANNEL_LABELS.get(result.get("channel", "stable"), "稳定版")
+        if not FROZEN:
+            if not startup:
+                messagebox.showinfo(
+                    "检查更新",
+                    f"发现新版本 {result['latest']}（{channel}）。\n\n"
+                    "当前是源码运行，不支持程序内自动安装；请下载安装包更新。",
+                    parent=self.root)
+            return
+        mode = updater.install_mode()
+        if mode == "source":
+            return
+        dialog = UpdatePromptDialog(self.root, result["latest"], channel, startup)
+        if dialog.choice == "skip":
+            self.config["skipped_update"] = result["latest"]
+            try:
+                save_settings(self.config_path, validate_settings(self.config))
+            except (ValueError, OSError):
+                pass
+        elif dialog.choice == "install":
+            UpdateDownloadWindow(self, result)
+
+    def install_downloaded(self, package, mode, workdir):
+        pids = [os.getpid()]
+        if self.process is not None:
+            try:
+                pids.append(self.process.pid)
+                self.process.terminate()
+            except OSError:
+                pass
+        try:
+            updater.launch_apply(package, mode, Path(sys.executable).resolve().parent,
+                                 Path(sys.executable), pids, workdir)
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            messagebox.showerror("无法启动更新", str(exc), parent=self.root)
+            return
+        self.notice.configure(text="正在安装更新，程序将自动重启…")
+        self.root.after(800, self.close)
 
     def stop(self):
         if self.process and not self.stopping:
@@ -1181,16 +1365,12 @@ class GuardApp:
             if kind == "update":
                 self.checking_updates = False
                 self.update_button.configure(state="normal", text="检查 GitHub 更新")
+                startup = bool(event.get("startup"))
                 if "error" in event:
-                    messagebox.showwarning("检查更新失败", event["error"], parent=self.root)
-                elif event["result"]["available"]:
-                    result = event["result"]
-                    channel = CHANNEL_LABELS.get(result.get("channel", "stable"), "稳定版")
-                    if messagebox.askyesno("发现新版本", f"当前版本：{VERSION}\n新版本：{result['latest']}（{channel}）\n\n是否打开 GitHub 发布页下载？", parent=self.root):
-                        webbrowser.open(result["url"])
+                    if not startup:
+                        messagebox.showwarning("检查更新失败", event["error"], parent=self.root)
                 else:
-                    text = "仓库尚未发布可识别的版本。" if event["result"]["latest"] is None else "当前已是最新版本。"
-                    messagebox.showinfo("检查更新", f"当前版本：{VERSION}\n{text}", parent=self.root)
+                    self._handle_update_result(event["result"], startup)
             elif kind == "log":
                 self.append_log(event["text"], event.get("level", "INFO"))
             elif kind in ("inventory", "inventory_error"):

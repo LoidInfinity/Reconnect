@@ -66,6 +66,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; 安装包自身携带的是 PyInstaller 的 onedir 产物，整目录复制
 Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+; 覆盖安装前清掉旧的运行库目录，避免旧版本模块残留（数据目录不在 {app} 内）
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\NetworkGuard.exe"
 Name: "{group}\{#MyAppName}（命令行）"; Filename: "{app}\start_cli.bat"; WorkingDir: "{app}"; IconFilename: "{app}\NetworkGuardCLI.exe"

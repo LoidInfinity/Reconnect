@@ -243,6 +243,8 @@ def save_default_config(config_file: Path) -> None:
 		"wifi_radio_recovery": True,
 		"disable_adapter_power_saving": True,
 		"update_channel": "stable",
+		"check_updates_on_startup": True,
+		"skipped_update": "",
 		"wired_recovery": True,
 		"wired_reset_on_failure": True,
 		"adapter_reset_on_failure": True,
