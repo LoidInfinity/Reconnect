@@ -19,7 +19,7 @@
 | PowerShell | 不再把变量拼进脚本。重置有线网卡时，网卡名通过环境变量 `NG_ADAPTER_NAME` 传入，脚本本身是固定文本，引号/分号无法变成代码。 |
 | 名称过滤 | 含控制字符或格式字符（换行、ESC、双向覆盖 `U+202E` 等）的配置名一律**不参与重连**；日志展示统一经过 `display_name()` 清洗。 |
 | 单行文件 | 状态文件、`config/hidden_wifi.txt` 写入前拒绝含换行的名称，避免被注入额外记录。 |
-| 日志 | `SafeFormatter` 去除 ANSI 转义与 `\r`；SSID / BSSID / MAC 仍按原规则脱敏，防止日志伪造与终端控制。 |
+| 日志 | `SafeFormatter` 去除 ANSI 转义与 `\r`；SSID / BSSID / MAC 脱敏，Wi-Fi 配置名以 `<profile:xxxx>` 伪名记录（可关联、不泄露名称），防止日志伪造与终端控制。 |
 | 配置校验 | 网卡名、首选/禁用名单、DNS 重置网卡列表出现控制字符时直接拒绝保存。 |
 | 安装包 | 清“下载标记”改用 Inno Setup 的 `[Code]` + `DeleteFile` 删除 `:Zone.Identifier` 数据流，**不再用 PowerShell 拼接安装路径**，路径中的引号无法注入脚本。 |
 | 更新检查 | 只读取 GitHub Release 的版本号并用浏览器打开官方 Release 页，不下载、不执行任何更新内容。 |

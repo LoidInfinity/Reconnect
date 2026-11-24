@@ -43,6 +43,12 @@ class NameSanitizerTests(unittest.TestCase):
         self.assertNotIn("\u202e", text)
         self.assertIn("Cafe", text)
 
+    def test_profile_names_are_pseudonymized(self):
+        masked = main.mask_profile("SecretCafe")
+        self.assertNotIn("SecretCafe", masked)
+        self.assertEqual(masked, main.mask_profile("SecretCafe"))
+        self.assertNotEqual(masked, main.mask_profile("OtherCafe"))
+
     def test_formatter_strips_ansi_and_carriage_returns(self):
         formatter = main.SafeFormatter("%(message)s")
         record = logging.LogRecord("x", logging.INFO, "", 0, "ssid \x1b[2J\rnext", None, None)

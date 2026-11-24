@@ -224,7 +224,7 @@ SSID / 配置名被当作**不可信输入**处理：所有命令走参数列表
 
 ## 隐私说明
 
-- 日志中的 SSID、AP BSSID、网卡物理地址与 GUID 会被替换为 `<redacted>` / `<mac>` / `<guid>`，界面仍正常显示。
+- 日志中的 SSID、AP BSSID、网卡物理地址与 GUID 会被替换为 `<redacted>` / `<mac>` / `<guid>`；Wi-Fi 配置名以 `<profile:xxxx>` 形式出现（可跨行关联，但不暴露名称），界面仍正常显示。
 - 检测地址与 DNS 监测域名均为公共站点，不含个人或单位内部域名。
 - 配置、日志、状态、PID 均被 `.gitignore` 排除。需要版本化配置时请提交不含真实信息的 `config/network_guard_config.example.json`；真实配置中的 Wi-Fi 名称与内网地址不应入库。
 

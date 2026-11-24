@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -107,6 +108,16 @@ def display_name(value: str | None, limit: int = 80) -> str:
 	)
 	text = " ".join(text.split())
 	return text[:limit] or "(空)"
+
+
+def mask_profile(value: str | None) -> str:
+	"""Stable pseudonym for a Wi-Fi profile name in logs.
+
+	The name is often the SSID (personal/campus/venue), so disk logs only keep
+	a short hash: still correlatable across lines, but not the network name.
+	"""
+	digest = hashlib.sha1(str(value or "").encode("utf-8", "replace")).hexdigest()[:4]
+	return f"<profile:{digest}>"
 
 
 class SafeFormatter(logging.Formatter):
@@ -629,7 +640,7 @@ def get_wifi_interfaces(logger: logging.Logger, interface_name: str | None) -> l
 			)
 	if interface_name:
 		interfaces = [item for item in interfaces if item.name.casefold() == interface_name.casefold()]
-	logger.debug("识别到 Wi-Fi 网卡: %s", interfaces)
+	logger.debug("识别到 Wi-Fi 网卡: %s", redact(str(interfaces)))
 	return interfaces
 
 
@@ -655,7 +666,7 @@ def get_saved_profiles(logger: logging.Logger) -> list[str]:
 			continue
 		seen.add(key)
 		deduped.append(profile)
-	logger.debug("已保存的 Wi-Fi 配置: %s", [display_name(name) for name in deduped])
+	logger.debug("已保存的 Wi-Fi 配置: %s", [mask_profile(name) for name in deduped])
 	return deduped
 
 
@@ -1027,7 +1038,7 @@ def recover_network(
 		return False
 
 	logger.info("开始自动恢复，共有 %d 个候选配置，限定时间 %d 秒", len(candidates), reconnect_timeout)
-	logger.info("恢复优先级顺序: %s", " → ".join(candidates))
+	logger.info("恢复优先级顺序: %s", " → ".join(mask_profile(name) for name in candidates))
 	deadline = time.time() + reconnect_timeout
 
 	for idx, profile_name in enumerate(candidates, 1):
@@ -1036,22 +1047,22 @@ def recover_network(
 			return False
 
 		remaining_time = int(deadline - time.time())
-		logger.info("[%d/%d] 尝试连接 Wi-Fi 配置: %s (剩余时间: %d 秒)", idx, len(candidates), display_name(profile_name), remaining_time)
+		logger.info("[%d/%d] 尝试连接 Wi-Fi 配置: %s (剩余时间: %d 秒)", idx, len(candidates), mask_profile(profile_name), remaining_time)
 		
 		if not connect_wifi(profile_name, logger, interface_name):
-			logger.debug("配置 %s 连接请求发送失败，跳过", display_name(profile_name))
+			logger.debug("配置 %s 连接请求发送失败，跳过", mask_profile(profile_name))
 			continue
 
 		attempt_deadline = min(deadline, time.time() + 20)
 		check_interval = 3
 		attempts = 0
 		
-		logger.debug("等待配置 %s 的网络恢复（最多 20 秒）...", display_name(profile_name))
+		logger.debug("等待配置 %s 的网络恢复（最多 20 秒）...", mask_profile(profile_name))
 		while time.time() < attempt_deadline:
 			attempts += 1
 			if is_internet_reachable(logger, check_targets):
 				elapsed_time = int(time.time() - (deadline - reconnect_timeout))
-				logger.info("✓ 网络已恢复！配置: %s，总耗时: %d 秒，尝试次数: %d", display_name(profile_name), elapsed_time, attempts)
+				logger.info("✓ 网络已恢复！配置: %s，总耗时: %d 秒，尝试次数: %d", mask_profile(profile_name), elapsed_time, attempts)
 				write_state_file(state_file, profile_name, logger)
 				return True
 			
@@ -1061,7 +1072,7 @@ def recover_network(
 			
 			time.sleep(check_interval)
 
-		logger.warning("配置 %s 已发起连接，但在 20 秒内仍未恢复联网 (尝试 %d 次)", display_name(profile_name), attempts)
+		logger.warning("配置 %s 已发起连接，但在 20 秒内仍未恢复联网 (尝试 %d 次)", mask_profile(profile_name), attempts)
 
 	logger.error("✗ 已尝试全部 %d 个候选 Wi-Fi 配置，网络仍未恢复。", len(candidates))
 
