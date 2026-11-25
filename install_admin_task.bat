@@ -19,9 +19,22 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem Prefer the bundled interpreter, fall back to pythonw on PATH.
+rem Prefer the bundled interpreter, else resolve pythonw.exe to an ABSOLUTE path.
+rem A bare "pythonw.exe" would depend on PATH at logon time and can silently fail.
 set "PYW=%~dp0.conda\pythonw.exe"
-if not exist "%PYW%" set "PYW=pythonw.exe"
+if not exist "%PYW%" set "PYW="
+if not defined PYW (
+    for /f "delims=" %%I in ('where pythonw.exe 2^>nul') do (
+        if not defined PYW set "PYW=%%I"
+    )
+)
+if not defined PYW (
+    echo [FAIL] pythonw.exe not found.
+    echo        Install Python, or run start_gui.bat once so a Python is on PATH.
+    pause
+    exit /b 1
+)
+echo       Interpreter: %PYW%
 
 set "APP=%~dp0src\gui.py"
 set "CFG=%~dp0data\network_guard_config.json"
